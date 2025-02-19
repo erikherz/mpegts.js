@@ -26,6 +26,7 @@ import RangeLoader from './xhr-range-loader.js';
 import WebSocketLoader from './websocket-loader.js';
 import RangeSeekHandler from './range-seek-handler.js';
 import ParamSeekHandler from './param-seek-handler.js';
+import WebTransportLoader from './webtransport-loader.js'; // added by Vivoh
 import {RuntimeException, IllegalStateException, InvalidArgumentException} from '../utils/exception.js';
 
 /**
@@ -69,6 +70,7 @@ class IOController {
 
         this._dataSource = dataSource;
         this._isWebSocketURL = /wss?:\/\/(.+?)/.test(dataSource.url);
+        this._isWebTransportURL = /^https:\/\/.+$/.test(dataSource.url) && typeof self.WebTransport !== 'undefined'; // added by Vivoh
         this._refTotalLength = dataSource.filesize ? dataSource.filesize : null;
         this._totalLength = this._refTotalLength;
         this._fullRequestFlag = false;
@@ -239,6 +241,8 @@ class IOController {
     _selectLoader() {
         if (this._config.customLoader != null) {
             this._loaderClass = this._config.customLoader;
+        } else if (this._isWebTransportURL) {  // added by Vivoh 
+            this._loaderClass = WebTransportLoader; // added by Vivoh	
         } else if (this._isWebSocketURL) {
             this._loaderClass = WebSocketLoader;
         } else if (FetchStreamLoader.isSupported()) {
