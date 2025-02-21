@@ -19,36 +19,140 @@ import {BaseLoader, LoaderStatus, LoaderErrors} from './loader.js';
 import {RuntimeException} from '../utils/exception.js';
 
 class PacketLogger {
-    constructor(onLog) {
-        this.packetCount = 0;
-        this.onLog = onLog || (() => {});
-    }
+	constructor(onLog) {
+	    this.packetCount = 0;
+	    this.onLog = onLog || (() => {});
+
+	    // 🛠 PTS tracking & estimation
+	    this.lastValidPTS = null;  // Most recent valid PTS
+	    this.prevPTS = null;       // PTS from the previous frame
+	    this.estimatedFrameDuration = 3003; // Default for 30 FPS (90,000 / 30)
+	    this.wraparoundOffset = 0; // Track wraparound corrections
+
+	    // 🛠 Track how many times each PID was skipped
+	    this.skipCountPerPID = {};
+	}
 
     logPacket(packet, timeReceived) {
         this.packetCount++;
+        let pts = this._extractPTS(packet);
 
-        // Only log the 1st, 100th, 1000th, and every 1000th after that
+        // 🔄 Handle missing PTS by estimating
+        if (pts === null) {
+            pts = this._estimatePTS();
+            if (this.packetCount % 100 === 0) { // Reduce verbosity
+                this.onLog(`[PacketLogger] ❗ Missing PTS, estimating: ${pts}`);
+            }
+        } else {
+            pts = this._handleWraparound(pts);
+            this._checkPTSOrdering(pts);
+            this.lastValidPTS = pts;
+        }
+
+        // 📌 Log at key packet intervals
         if (this.packetCount === 1 || this.packetCount === 100 || this.packetCount === 1000 || this.packetCount % 1000 === 0) {
-            const pts = this._extractPTS(packet);
             this.onLog(`[PacketLogger] #${this.packetCount} | PTS: ${pts} | Received at: ${timeReceived}`);
         }
     }
 
-    _extractPTS(packet) {
-        if (packet.length < 14 || (packet[7] & 0x80) === 0) {
-            return "N/A";
+	_extractPTS(packet) {
+	    if (packet.length < 19) {
+		this.onLog(`[PacketLogger] ❗ Packet too short for PTS extraction`);
+		return null;
+	    }
+
+	    // ✅ Verify sync byte
+	    if (packet[0] !== 0x47) {
+		this.onLog(`[PacketLogger] ❗ Invalid TS packet, missing sync byte`);
+		return null;
+	    }
+
+	    // ✅ Extract PID
+	    const pid = ((packet[1] & 0x1F) << 8) | packet[2];
+
+	    // ✅ Ignore NULL packets
+	    if (pid === 0x1FFF) return null;
+
+	    // ✅ Check for payload
+	    const adaptationFieldControl = (packet[3] & 0x30) >> 4;
+	    if (adaptationFieldControl === 0x00 || adaptationFieldControl === 0x02) return null;
+
+	    let payloadStart = 4;
+	    if (adaptationFieldControl === 0x03) payloadStart += 1 + packet[4];
+
+	    // ✅ Ensure it's a PES header
+	    if (packet[payloadStart] !== 0x00 || packet[payloadStart + 1] !== 0x00 || packet[payloadStart + 2] !== 0x01) {
+		this.skipCountPerPID[pid] = (this.skipCountPerPID[pid] || 0) + 1;
+		if (this.skipCountPerPID[pid] <= 3) {  // Log only first 3 occurrences per PID
+		    this.onLog(`[PacketLogger] ❗ Skipping PID ${pid} - Not a PES header`);
+		}
+		return null;
+	    }
+
+	    // ✅ Extract PTS if present
+	    const ptsDtsFlags = (packet[payloadStart + 7] & 0xC0) >> 6;
+	    if (ptsDtsFlags === 0) {
+		this.onLog(`[PacketLogger] ❗ No PTS in PID ${pid}`);
+		return null;
+	    }
+
+	    const ptsOffset = payloadStart + 9;
+	    return ((packet[ptsOffset] & 0x0E) << 29) |
+		   ((packet[ptsOffset + 1] & 0xFF) << 22) |
+		   ((packet[ptsOffset + 2] & 0xFE) << 14) |
+		   ((packet[ptsOffset + 3] & 0xFF) << 7) |
+		   ((packet[ptsOffset + 4] & 0xFE) >> 1);
+	}
+
+	_handleWraparound(pts) {
+	    if (this.lastValidPTS !== null && pts < this.lastValidPTS) {
+		const ptsDrop = this.lastValidPTS - pts;
+
+		// Only adjust for wraparound if drop exceeds 4GB (approx 47 minutes)
+		if (ptsDrop > 4294967296) { 
+		    this.wraparoundOffset += 8589934592;
+		    this.onLog(`[PacketLogger] ⚠️ PTS wraparound detected! New offset: ${this.wraparoundOffset}`);
+		} else {
+		    this.onLog(`[PacketLogger] ❓ Small PTS drop (${ptsDrop}), not a wraparound.`);
+		}
+
+		pts += this.wraparoundOffset;
+	    }
+	    return pts;
+	}
+
+
+    _checkPTSOrdering(currentPTS) {
+        if (this.lastValidPTS !== null && currentPTS < this.lastValidPTS - 90000) {
+            this.onLog(`[PacketLogger] ⚠️ Possible PTS disorder: ${currentPTS} < ${this.lastValidPTS}`);
         }
-
-        const pts = ((packet[9] & 0x0E) << 29) |
-                    ((packet[10] & 0xFF) << 22) |
-                    ((packet[11] & 0xFE) << 14) |
-                    ((packet[12] & 0xFF) << 7) |
-                    ((packet[13] & 0xFE) >> 1);
-
-        return pts;
     }
-}
 
+	_estimatePTS() {
+	    if (this.lastValidPTS === null) {
+		return 90000; // Start from a reasonable default (1 second @ 90kHz)
+	    }
+
+	    // If previous PTS is same as lastValidPTS, avoid recalculating
+	    if (this.prevPTS === this.lastValidPTS) {
+		return this.lastValidPTS + this.estimatedFrameDuration;
+	    }
+
+	    const diff = this.lastValidPTS - this.prevPTS;
+
+	    // Ignore outliers, but allow natural frame durations
+	    if (diff > 500 && diff < 50000) {  
+		this.estimatedFrameDuration = diff;
+	    } else if (diff !== 0) {
+		this.onLog(`[PacketLogger] ⚠️ Unusual frame duration: ${diff}, ignoring.`);
+	    }
+
+	    this.prevPTS = this.lastValidPTS;
+	    this.lastValidPTS += this.estimatedFrameDuration;
+	    return this.lastValidPTS;
+	}
+
+}
 class MPEGTSBuffer {
     constructor(onLog) {
         this.PACKET_SIZE = 188;
@@ -70,7 +174,7 @@ class MPEGTSBuffer {
 	    this.buffer = newBuffer;
 
 	    // Find first valid sync byte
-	    let syncIndex = this._findSyncByte(this.buffer);
+	    let syncIndex = this.tsBuffer._findSyncByte(this.buffer);
 	    if (syncIndex === -1) {
 		this.buffer = new Uint8Array(0); // 🛑 Reset buffer if no sync found (avoid corrupt state)
 		return null;
@@ -123,7 +227,6 @@ class MPEGTSBuffer {
         return validPackets.length > 0 ? validPackets : null;
     }
 }
-
 class WebTransportLoader extends BaseLoader {
     constructor() {
         super('webtransport-loader');
@@ -199,8 +302,10 @@ class WebTransportLoader extends BaseLoader {
 
 	async _readChunks() {
 	    try {
-		let fragmentBuffer = new Uint8Array(0); // Store leftover data from previous chunk
-		let syncRecovered = false; // Flag to track sync recovery state
+		let fragmentBuffer = new Uint8Array(0);
+		const TS_PACKET_SIZE = 188;
+		const SYNC_BYTE = 0x47;
+		let firstChunkProcessed = false;
 
 		while (true) {
 		    const { value, done } = await this._reader.read();
@@ -210,55 +315,61 @@ class WebTransportLoader extends BaseLoader {
 			let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
 			Log.v(this.TAG, `Received chunk of ${chunk.byteLength} bytes`);
 
-			// 🛠 Merge any leftover bytes from previous chunk
+			// ✅ Always prepend leftover bytes from the previous chunk
 			if (fragmentBuffer.length > 0) {
 			    let merged = new Uint8Array(fragmentBuffer.length + chunk.length);
 			    merged.set(fragmentBuffer, 0);
 			    merged.set(chunk, fragmentBuffer.length);
 			    chunk = merged;
-			    fragmentBuffer = new Uint8Array(0); // Clear buffer
+			    fragmentBuffer = new Uint8Array(0);
 			}
 
-			// 🔍 **Find a Valid MPEG-TS Sync Byte**
-			let syncIndex = chunk.indexOf(0x47);
-			if (syncIndex === -1) {
-			    Log.w(this.TAG, `❌ No sync byte found in chunk, discarding ${chunk.byteLength} bytes`);
-			    continue; // Drop corrupt chunk
+			let offset = 0;
+			let totalLength = chunk.length;
+
+			// ✅ Handle first chunk separately
+			if (!firstChunkProcessed) {
+			    let syncPos = chunk.indexOf(SYNC_BYTE);
+			    if (syncPos === -1) {
+				Log.w(this.TAG, `⚠️ No sync byte found in the first chunk, discarding entire chunk`);
+				continue;  // Skip this chunk and wait for the next one
+			    }
+			    if (syncPos > 0) {
+				Log.w(this.TAG, `⚠️ Skipping ${syncPos} bytes before first sync`);
+				chunk = chunk.slice(syncPos);
+				totalLength = chunk.length;
+			    }
+			    firstChunkProcessed = true;
 			}
 
-			// 🛠 **Realign MPEG-TS packets**
-			let alignedData = chunk.slice(syncIndex);
-			let validPackets = [];
+			let numPackets = Math.floor(totalLength / TS_PACKET_SIZE);
+			let leftoverBytes = totalLength % TS_PACKET_SIZE;
 
-			for (let i = 0; i + 188 <= alignedData.length; i += 188) {
-			    if (alignedData[i] === 0x47) {
-				validPackets.push(alignedData.slice(i, i + 188));
-				syncRecovered = true; // Mark sync as recovered
-			    } else if (syncRecovered) {
-				Log.w(this.TAG, `⚠️ Lost sync at offset ${i}, attempting recovery`);
-				let nextSync = alignedData.indexOf(0x47, i + 1);
-				if (nextSync !== -1) {
-				    i = nextSync - 188; // Jump to next valid packet
+			// ✅ Extract and forward all full 188-byte packets
+			for (let i = 0; i < numPackets; i++) {
+			    let packetStart = i * TS_PACKET_SIZE;
+			    let packet = chunk.slice(packetStart, packetStart + TS_PACKET_SIZE);
+
+			    if (packet[0] === SYNC_BYTE) {
+				//this.packetLogger.logPacket(packet, Date.now());
+				if (this._onDataArrival) {
+				    this._onDataArrival(packet, this._receivedLength, this._receivedLength + TS_PACKET_SIZE);
 				}
+				this._receivedLength += TS_PACKET_SIZE;
+			    } else {
+				Log.e(this.TAG, `[TSDemuxer] ❗ Sync byte missing at packet boundary (expected 0x47, got ${packet[0]})`);
 			    }
 			}
 
-			// 🛠 **Store leftover bytes for the next chunk**
-			let leftoverBytes = alignedData.length % 188;
+			// ✅ Always store any remaining bytes for the next chunk
 			if (leftoverBytes > 0) {
-			    fragmentBuffer = alignedData.slice(alignedData.length - leftoverBytes);
-			    Log.v(this.TAG, `🔄 Buffered ${leftoverBytes} bytes for next chunk`);
-			}
-
-			// 🚀 **Process valid packets**
-			if (validPackets.length > 0) {
-			    const byteStart = this._receivedLength;
-			    this._receivedLength += validPackets.length * 188;
-
-			    validPackets.forEach(packet => this.packetLogger.logPacket(packet, Date.now()));
-
-			    if (this._onDataArrival) {
-				this._onDataArrival(new Uint8Array(validPackets.flat()), byteStart, this._receivedLength);
+			    let tailData = chunk.slice(numPackets * TS_PACKET_SIZE);
+			    if (tailData[0] === SYNC_BYTE) {
+				fragmentBuffer = new Uint8Array(0);  // Clear it first
+				fragmentBuffer = tailData;  // Then store new fragment
+				Log.v(this.TAG, `🔄 Buffered ${leftoverBytes} bytes for next chunk`);
+			    } else {
+				Log.w(this.TAG, `⚠️ Dropping ${leftoverBytes} bytes (not part of a valid TS packet)`);
 			    }
 			}
 		    }
@@ -274,3 +385,4 @@ class WebTransportLoader extends BaseLoader {
 }
 
 export default WebTransportLoader;
+
