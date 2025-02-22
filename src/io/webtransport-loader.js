@@ -231,7 +231,7 @@ class PacketLogger {
     }
 
 _extractPTS(payload) {
-    // Validation
+    // Validation checks
     if (payload.length < 14) return null;
     if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) {
         this.debugStats.notPESHeader++;
@@ -250,39 +250,27 @@ _extractPTS(payload) {
     // Get PTS bytes
     const byte1 = payload[9];   // 0010 XXXX
     const byte2 = payload[10];  // XXXX XXXX
-    const byte3 = payload[11];  // XXXX XXX1
+    const byte3 = payload[11];  // XXXX XXX1 (marker)
     const byte4 = payload[12];  // XXXX XXXX
-    const byte5 = payload[13];  // XXXX XXX1
+    const byte5 = payload[13];  // XXXX XXX1 (marker)
 
     // Verify marker bits
-    if ((byte1 & 0xF0) !== 0x20) {
-        this.onLog(`Invalid PTS marker bits in byte1: ${this._formatBits(byte1)}`);
-        return null;
+    if ((byte1 & 0xF0) !== 0x20) return null;
+    if ((byte3 & 0x01) !== 0x01 || (byte5 & 0x01) !== 0x01) return null;
+
+    // Extract relevant bits (ignoring marker bits)
+    const b1 = byte1 & 0x0F;
+    const b2 = byte2;
+    const b4 = byte4;
+
+    // Calculate PTS
+    const pts = ((b1 << 29) | (b2 << 22) | (b4 << 7)) >>> 0;
+    
+    // Log only on 1st, 100th, 1000th, and each 1000th packet
+    if (this.packetCount === 1 || this.packetCount === 100 || 
+        this.packetCount === 1000 || this.packetCount % 1000 === 0) {
+        this.onLog(`[OK] PTS extracted = ${pts} (packet #${this.packetCount})`);
     }
-    if ((byte3 & 0x01) !== 0x01 || (byte5 & 0x01) !== 0x01) {
-        this.onLog(`Invalid PTS marker bits in byte3/5: ${this._formatBits(byte3)}, ${this._formatBits(byte5)}`);
-        return null;
-    }
-
-    // Calculate each byte's contribution
-    const b1Contrib = ((byte1 & 0x0F) >>> 0) << 29;    // 4 bits from byte1 -> upper 4 bits
-    const b2Contrib = (byte2 >>> 0) << 22;             // 8 bits from byte2
-    const b3Contrib = ((byte3 & 0xFE) >>> 1) << 15;    // 7 bits from byte3 (ignore marker)
-    const b4Contrib = (byte4 >>> 0) << 7;              // 8 bits from byte4
-    const b5Contrib = (byte5 & 0xFE) >>> 1;            // 7 bits from byte5 (ignore marker)
-
-    // Combine all parts
-    const pts = b1Contrib | b2Contrib | b3Contrib | b4Contrib | b5Contrib;
-
-    this.onLog(`PTS calculation:
-            Raw bytes: ${[byte1, byte2, byte3, byte4, byte5].map(b => b.toString(16).padStart(2, '0')).join(' ')}
-            Binary: ${[byte1, byte2, byte3, byte4, byte5].map(b => this._formatBits(b)).join(' ')}
-            Byte1 contribution: ${b1Contrib.toString(16)}
-            Byte2 contribution: ${b2Contrib.toString(16)}
-            Byte3 contribution: ${b3Contrib.toString(16)}
-            Byte4 contribution: ${b4Contrib.toString(16)}
-            Byte5 contribution: ${b5Contrib.toString(16)}
-            Final PTS: ${pts.toString(16)} (${pts})`);
 
     return pts;
 }
