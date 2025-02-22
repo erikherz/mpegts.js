@@ -168,7 +168,7 @@ class PacketLogger {
                         this.debugStats.pts.shift();
                     }
                     
-                    this.onLog(`Found PTS: ${pts} in video packet #${this.debugStats.videoPIDPackets}`);
+                    //this.onLog(`Found PTS: ${pts} in video packet #${this.debugStats.videoPIDPackets}`);
                 }
             }
         }
@@ -199,7 +199,7 @@ class PacketLogger {
             const pesExtensionFlag = payload[7] & 0x01;
             const pesHeaderLength = payload[8];
 
-            this.onLog(`PES Header Detailed Debug:
+            /* this.onLog(`PES Header Detailed Debug:
                 Start Code: ${payload[0].toString(16)},${payload[1].toString(16)},${payload[2].toString(16)}
                 Stream ID: 0x${streamId.toString(16)}
                 Packet Length: ${pesPacketLength}
@@ -223,6 +223,7 @@ class PacketLogger {
                     Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${this._formatBits(payload[11])}
                     Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${this._formatBits(payload[12])}
                     Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${this._formatBits(payload[13])}`);
+	      */
         }
     }
 
@@ -230,50 +231,99 @@ class PacketLogger {
         return byte.toString(2).padStart(8, '0').match(/.{1,4}/g).join(' ');
     }
 
-_extractPTS(payload) {
-    // Validation checks
-    if (payload.length < 14) return null;
-    if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) {
-        this.debugStats.notPESHeader++;
-        return null;
-    }
+	logDetailedStatsConditional(timeReceived, payload) {
+	    // Only log for the 1st, 100th, 1000th, and every 1000th packet thereafter.
+	    if (this.packetCount === 1 || this.packetCount === 100 || this.packetCount % 1000 === 0) {
+		// Build Packet Stats message.
+		const pts = (this.lastValidPTS !== null)
+		    ? this.lastValidPTS
+		    : (this.packetCount * this.estimatedFrameDuration);
+		let statsMsg = `[WebTransportLoader] > Packet Stats #${this.packetCount}:\n`;
+		statsMsg += `            PTS: ${pts}\n`;
+		statsMsg += `            Received at: ${timeReceived}\n`;
+		statsMsg += `            Total Packets: ${this.debugStats.totalPackets}\n`;
+		statsMsg += `            Video PID (256) Packets: ${this.debugStats.videoPIDPackets}\n`;
+		statsMsg += `            PES Packet Starts: ${this.debugStats.pesStarts}\n`;
+		statsMsg += `            Valid PTS Found: ${this.debugStats.validPTS}\n`;
+		statsMsg += `            Not PES Header: ${this.debugStats.notPESHeader}\n`;
+		statsMsg += `            No PTS: ${this.debugStats.noPTS}\n`;
+		statsMsg += `            Last 5 PTS values: ${this.debugStats.pts.join(', ')}\n`;
+		this.onLog(statsMsg);
 
-    const streamId = payload[3];
-    if (streamId < 0xE0 || streamId > 0xEF) return null;
+		// Log PES Header Detailed Debug if the payload is available.
+		if (payload && payload.length >= 14) {
+		    let headerMsg = `[WebTransportLoader] > PES Header Detailed Debug:\n`;
+		    headerMsg += `                Start Code: ${payload[0]},${payload[1]},${payload[2]}\n`;
+		    headerMsg += `                Stream ID: 0x${payload[3].toString(16)}\n`;
+		    headerMsg += `                Packet Length: ${(payload[4] << 8) | payload[5]}\n`;
+		    headerMsg += `                Scrambling Control: ${(payload[6] & 0x30) >> 4}\n`;
+		    headerMsg += `                Priority: ${(payload[6] & 0x08) >> 3}\n`;
+		    headerMsg += `                Data Alignment: ${(payload[6] & 0x04) >> 2}\n`;
+		    headerMsg += `                Copyright: ${(payload[6] & 0x02) >> 1}\n`;
+		    headerMsg += `                Original/Copy: ${payload[6] & 0x01}\n`;
+		    headerMsg += `                PTS_DTS_flags: ${(payload[7] & 0xC0) >> 6}\n`;
+		    headerMsg += `                ESCR flag: ${(payload[7] & 0x20) >> 5}\n`;
+		    headerMsg += `                ES Rate flag: ${(payload[7] & 0x10) >> 4}\n`;
+		    headerMsg += `                DSM Trick Mode: ${(payload[7] & 0x08) >> 3}\n`;
+		    headerMsg += `                Additional Copy Info: ${(payload[7] & 0x04) >> 2}\n`;
+		    headerMsg += `                PES CRC flag: ${(payload[7] & 0x02) >> 1}\n`;
+		    headerMsg += `                PES Extension: ${payload[7] & 0x01}\n`;
+		    headerMsg += `                PES Header Length: ${payload[8]}\n`;
+		    headerMsg += `                Raw PTS bytes: ${payload.slice(9, 14).map(b => b.toString(16).padStart(2, '0')).join(' ')}\n`;
+		    headerMsg += `                PTS byte details:\n`;
+		    headerMsg += `                    Byte 1 (0x${payload[9].toString(16).padStart(2, '0')}): ${payload[9].toString(2).padStart(8, '0')}\n`;
+		    headerMsg += `                    Byte 2 (0x${payload[10].toString(16).padStart(2, '0')}): ${payload[10].toString(2).padStart(8, '0')}\n`;
+		    headerMsg += `                    Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${payload[11].toString(2).padStart(8, '0')}\n`;
+		    headerMsg += `                    Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${payload[12].toString(2).padStart(8, '0')}\n`;
+		    headerMsg += `                    Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${payload[13].toString(2).padStart(8, '0')}\n`;
+		    this.onLog(headerMsg);
+		}
+	    }
+	}
 
-    const ptsDtsFlags = (payload[7] & 0xC0) >> 6;
-    if (ptsDtsFlags === 0) {
-        this.debugStats.noPTS++;
-        return null;
-    }
+	_extractPTS(payload) {
+	    this.logDetailedStatsConditional(Date.now(), payload);
+	    // Ensure there is enough data and a valid PES start
+	    if (payload.length < 14) return null;
+	    if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) return null;
+	    if (payload[3] < 0xE0 || payload[3] > 0xEF) return null;
+	    if (((payload[7] & 0xC0) >> 6) === 0) return null;
 
-    // Get PTS bytes
-    const byte1 = payload[9];   // 0010 XXXX
-    const byte2 = payload[10];  // XXXX XXXX
-    const byte3 = payload[11];  // XXXX XXX1 (marker)
-    const byte4 = payload[12];  // XXXX XXXX
-    const byte5 = payload[13];  // XXXX XXX1 (marker)
+	    // The five PTS bytes are located at indexes 9 to 13.
+	    // Their bit layout is as follows:
+	    //   Byte 1: 4 bits constant (should be 0x2), 3 bits PTS[32..30], 1 marker bit (should be 1)
+	    //   Byte 2: 8 bits: PTS[29..22]
+	    //   Byte 3: 1 marker bit (should be 1), 7 bits: PTS[21..15]
+	    //   Byte 4: 8 bits: PTS[14..7]
+	    //   Byte 5: 1 marker bit (should be 1), 7 bits: PTS[6..0]
+	    const p0 = payload[9];  // e.g. 0x21
+	    const p1 = payload[10]; // e.g. 0x00
+	    const p2 = payload[11]; // e.g. 0x01
+	    const p3 = payload[12]; // e.g. 0x00
+	    const p4 = payload[13]; // e.g. 0x01
 
-    // Verify marker bits
-    if ((byte1 & 0xF0) !== 0x20) return null;
-    if ((byte3 & 0x01) !== 0x01 || (byte5 & 0x01) !== 0x01) return null;
+	    // Verify the fixed prefix in Byte 1 (upper 4 bits must equal 0x2)
+	    if ((p0 >> 4) !== 0x2) return null;
+	    // Verify marker bits: in Byte1, Byte3, and Byte5 the least-significant bit should be 1.
+	    if ((p0 & 0x01) !== 0x01) return null;
+	    if ((p2 & 0x01) !== 0x01) return null;
+	    if ((p4 & 0x01) !== 0x01) return null;
 
-    // Extract relevant bits (ignoring marker bits)
-    const b1 = byte1 & 0x0F;
-    const b2 = byte2;
-    const b4 = byte4;
+	    // Now extract the 33-bit PTS:
+	    const pts =
+		(((p0 >> 1) & 0x07) << 30) | // Bits 32-30
+		(p1 << 22) |                // Bits 29-22
+		(((p2 >> 1) & 0x7F) << 15) | // Bits 21-15
+		(p3 << 7) |                 // Bits 14-7
+		((p4 >> 1) & 0x7F);          // Bits 6-0
 
-    // Calculate PTS
-    const pts = ((b1 << 29) | (b2 << 22) | (b4 << 7)) >>> 0;
-    
-    // Log only on 1st, 100th, 1000th, and each 1000th packet
-    if (this.packetCount === 1 || this.packetCount === 100 || 
-        this.packetCount === 1000 || this.packetCount % 1000 === 0) {
-        this.onLog(`[OK] PTS extracted = ${pts} (packet #${this.packetCount})`);
-    }
+	    // Conditional logging: only log for packet #1, #100, and every 1000th packet thereafter.
+	    if (this.packetCount === 1 || this.packetCount === 100 || this.packetCount % 1000 === 0) {
+		this.onLog(`PTS #${this.packetCount}: ${pts}`);
+	    }
 
-    return pts;
-}
+	    return pts;
+	}
 
     _handleWraparound(pts) {
         if (this.lastValidPTS !== null && pts < this.lastValidPTS) {
