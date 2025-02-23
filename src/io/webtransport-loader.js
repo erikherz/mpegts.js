@@ -18,6 +18,104 @@ import Log from '../utils/logger.js';
 import {BaseLoader, LoaderStatus, LoaderErrors} from './loader.js';
 import {RuntimeException} from '../utils/exception.js';
 
+class TSPacketValidator {
+    constructor(options = {}) {
+        this.PACKET_SIZE = 188;
+        this.SYNC_BYTE = 0x47;
+        this.lastValidPID = null;
+        this.continuityCounters = new Map();
+        this.onLog = options.onLog || console.log;
+    }
+
+isLikelyValidPacketStart(buffer, index) {
+        // Ensure we have enough bytes to check
+        if (buffer.length < index + this.PACKET_SIZE) return false;
+
+        // Validate sync byte and spacing
+        if (buffer[index] !== this.SYNC_BYTE) {
+            this.logRawBytes(buffer, index, 4);
+            this.onLog(`[ERROR] Invalid sync byte at ${index}: 0x${buffer[index].toString(16)}`);
+            return false;
+        }
+
+        // Extract packet information
+        const pid = ((buffer[index + 1] & 0x1F) << 8) | buffer[index + 2];
+        const transportError = (buffer[index + 1] & 0x80) !== 0;
+        const hasAdaptationField = (buffer[index + 3] & 0x20) !== 0;
+        const hasPayload = (buffer[index + 3] & 0x10) !== 0;
+
+        // Basic validation checks
+        if (pid > 0x1FFF) {
+            this.onLog(`[ERROR] Invalid PID value 0x${pid.toString(16)} at ${index}`);
+            return false;
+        }
+
+        if (transportError) {
+            this.onLog(`[ERROR] Transport error at ${index}`);
+            return false;
+        }
+
+        if (!hasPayload && !hasAdaptationField) {
+            return false;
+        }
+
+        // Check for adaptation field length validity
+        if (hasAdaptationField) {
+            const adaptationLength = buffer[index + 4];
+            if (adaptationLength > 183) {
+                this.onLog(`[ERROR] Invalid adaptation field length ${adaptationLength} at ${index}`);
+                return false;
+            }
+        }
+
+        this.lastValidPID = pid;
+        return true;
+    }
+
+    validateContinuityCounter(pid, currentCounter) {
+        const lastCounter = this.continuityCounters.get(pid);
+
+        if (lastCounter !== undefined) {
+            const expectedCounter = (lastCounter + 1) & 0x0F;
+            if (currentCounter !== expectedCounter) {
+                return false;
+            }
+        }
+
+        this.continuityCounters.set(pid, currentCounter);
+        return true;
+    }
+
+    hasCorruptedSectionMarker(buffer, offset) {
+        const knownCorruptMarkers = [0x6c46, 0xf408];
+
+        if (buffer.length < offset + 2) return false;
+
+        const marker = (buffer[offset] << 8) | buffer[offset + 1];
+        return knownCorruptMarkers.includes(marker);
+    }
+
+    logRawBytes(buffer, start, length) {
+        const bytes = Array.from(buffer.slice(start, start + length))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join(' ');
+        this.onLog(`[RAW] Bytes at ${start}: ${bytes}`);
+    }
+
+    logVideoPacketDetails(buffer, index, payloadStart, hasAdaptationField, continuityCounter) {
+        const payloadOffset = hasAdaptationField ? 5 + buffer[index + 4] : 4;
+
+        this.onLog(`[DEBUG] Video packet at ${index}: START=${payloadStart}, AF=${hasAdaptationField}, CC=${continuityCounter}`);
+
+        if (payloadStart && buffer.length >= index + payloadOffset + 4) {
+            const startCode = buffer.slice(index + payloadOffset, index + payloadOffset + 4);
+            if (startCode[0] === 0x00 && startCode[1] === 0x00 &&
+                startCode[2] === 0x00 && startCode[3] === 0x01) {
+                this.onLog(`[DEBUG] Valid H.264 start code found at offset ${payloadOffset}`);
+            }
+        }
+    }
+}
 
 class MPEGTSBuffer {
     constructor(onLog) {
@@ -26,6 +124,18 @@ class MPEGTSBuffer {
         this.MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
         this.buffer = new Uint8Array(0);
         this.onLog = onLog || (() => {});
+        this.validator = new TSPacketValidator({ onLog: this.onLog });
+
+        
+        // Add validation statistics
+        this.stats = {
+            totalPacketsProcessed: 0,
+            validPackets: 0,
+            invalidPackets: 0,
+            pidDistribution: new Map(),
+            adaptationFieldCount: 0,
+            invalidSyncByteCount: 0
+        };
     }
 
     addChunk(chunk) {
@@ -33,11 +143,17 @@ class MPEGTSBuffer {
 
         const inputChunk = (chunk instanceof Uint8Array) ? chunk : new Uint8Array(chunk);
 
+        // Log incoming chunk details
+        this.onLog(`Processing new chunk of ${inputChunk.length} bytes`);
+
         // Append new data to existing buffer
         let newBuffer = new Uint8Array(this.buffer.length + inputChunk.length);
         newBuffer.set(this.buffer, 0);
         newBuffer.set(inputChunk, this.buffer.length);
         this.buffer = newBuffer;
+
+        // Log buffer state
+        this.onLog(`Total buffer size after append: ${this.buffer.length} bytes`);
 
         // Find first valid sync byte
         let syncIndex = this.findSyncByte(this.buffer);
@@ -65,13 +181,10 @@ class MPEGTSBuffer {
     }
 
     findSyncByte(buffer) {
-        if (!buffer || buffer.length === 0) return -1;
-        
         for (let i = 0; i <= buffer.length - this.PACKET_SIZE; i++) {
             if (buffer[i] === this.SYNC_BYTE) {
-                // Check if the next MPEG-TS packet aligns correctly
-                if ((i + this.PACKET_SIZE) < buffer.length && 
-                    buffer[i + this.PACKET_SIZE] === this.SYNC_BYTE) {
+                // Use new validator to check packet validity
+                if (this.validator.isLikelyValidPacketStart(buffer, i)) {
                     return i;
                 }
             }
@@ -81,15 +194,79 @@ class MPEGTSBuffer {
 
     validatePackets(packets) {
         const validPackets = [];
+        
         for (let i = 0; i < packets.length; i += this.PACKET_SIZE) {
-            if (packets[i] === this.SYNC_BYTE) {
-                validPackets.push(packets.slice(i, i + this.PACKET_SIZE));
-            } else {
-                this.onLog(`[MPEGTSBuffer] Skipping invalid packet at offset ${i}`);
+            this.stats.totalPacketsProcessed++;
+            const currentPacket = packets.slice(i, i + this.PACKET_SIZE);
+            
+            // Use new validator for packet validation
+            if (!this.validator.isLikelyValidPacketStart(currentPacket, 0)) {
+                this.stats.invalidPackets++;
+                this.stats.invalidSyncByteCount++;
+                this.onLog(`[ERROR] Invalid packet at offset ${i}`);
+                continue;
             }
+
+            // Extract packet information
+            const pid = ((currentPacket[1] & 0x1F) << 8) | currentPacket[2];
+            const hasAdaptationField = (currentPacket[3] & 0x20) !== 0;
+            const hasPayload = (currentPacket[3] & 0x10) !== 0;
+            const payloadStart = (currentPacket[1] & 0x40) !== 0;
+            
+            // Update statistics
+            this.stats.validPackets++;
+            this.stats.pidDistribution.set(pid, (this.stats.pidDistribution.get(pid) || 0) + 1);
+            if (hasAdaptationField) {
+                this.stats.adaptationFieldCount++;
+                
+                // Additional adaptation field validation
+                if (hasAdaptationField && currentPacket.length >= 5) {
+                    const adaptationLength = currentPacket[4];
+                    if (adaptationLength > 183) {
+                        this.onLog(`[WARNING] Suspicious adaptation field length: ${adaptationLength}`);
+                    }
+                }
+            }
+            
+            // Video packet debug logging (0x41)
+            if (pid === 0x0041 && hasPayload) {
+                const payloadOffset = hasAdaptationField ? 5 + currentPacket[4] : 4;
+                this.onLog(`[DEBUG] Video packet at ${i}: START=${payloadStart}, AF=${hasAdaptationField}`);
+                
+                if (payloadStart && currentPacket.length >= payloadOffset + 4) {
+                    const startCode = currentPacket.slice(payloadOffset, payloadOffset + 4);
+                    if (startCode[0] === 0x00 && startCode[1] === 0x00 &&
+                        startCode[2] === 0x00 && startCode[3] === 0x01) {
+                        this.onLog(`[DEBUG] Valid H.264 start code found in payload`);
+                    }
+                }
+            }
+            
+            validPackets.push(currentPacket);
         }
+
+        // Log periodic statistics
+        if (this.stats.totalPacketsProcessed % 1000 === 0) {
+            this.logStats();
+        }
+
         return validPackets.length > 0 ? validPackets : null;
     }
+	    logStats() {
+		let statsMsg = '\nMPEGTS Buffer Statistics:\n';
+		statsMsg += `Total Packets Processed: ${this.stats.totalPacketsProcessed}\n`;
+		statsMsg += `Valid Packets: ${this.stats.validPackets}\n`;
+		statsMsg += `Invalid Packets: ${this.stats.invalidPackets}\n`;
+		statsMsg += `Invalid Sync Bytes: ${this.stats.invalidSyncByteCount}\n`;
+		statsMsg += `Adaptation Fields: ${this.stats.adaptationFieldCount}\n`;
+		statsMsg += 'PID Distribution:\n';
+		
+		for (const [pid, count] of this.stats.pidDistribution.entries()) {
+		    statsMsg += `  PID 0x${pid.toString(16).padStart(4, '0')}: ${count} packets\n`;
+		}
+		
+		this.onLog(statsMsg);
+	    }
 }
 
 class PacketLogger {
@@ -179,6 +356,10 @@ class PacketLogger {
         }
     }
 
+    _formatBits(byte) {
+        return byte.toString(2).padStart(8, '0');
+    }
+
     _debugPESHeaderDetailed(payload) {
         if (payload.length < 19) return;
 
@@ -199,7 +380,20 @@ class PacketLogger {
             const pesExtensionFlag = payload[7] & 0x01;
             const pesHeaderLength = payload[8];
 
-            /* this.onLog(`PES Header Detailed Debug:
+            // Extract random access indicator from adaptation field
+            // The random_access_indicator is typically in the adaptation field
+            // which precedes the PES packet in the transport stream
+            const hasAdaptationField = (payload[6] & 0x20) >> 5;
+            let randomAccessIndicator = 0;
+            
+            if (hasAdaptationField && payload.length >= 20) {
+                const adaptationFieldLength = payload[19];
+                if (adaptationFieldLength > 0 && payload.length >= (20 + adaptationFieldLength)) {
+                    randomAccessIndicator = (payload[20] & 0x40) >> 6;
+                }
+            }
+
+            this.onLog(`PES Header Detailed Debug:
                 Start Code: ${payload[0].toString(16)},${payload[1].toString(16)},${payload[2].toString(16)}
                 Stream ID: 0x${streamId.toString(16)}
                 Packet Length: ${pesPacketLength}
@@ -216,6 +410,7 @@ class PacketLogger {
                 PES CRC flag: ${pesCrcFlag}
                 PES Extension: ${pesExtensionFlag}
                 PES Header Length: ${pesHeaderLength}
+                Random Access Indicator: ${randomAccessIndicator}
                 Raw PTS bytes: ${payload.slice(9, 14).map(b => b.toString(16).padStart(2, '0')).join(' ')}
                 PTS byte details:
                     Byte 1 (0x${payload[9].toString(16).padStart(2, '0')}): ${this._formatBits(payload[9])}
@@ -223,12 +418,18 @@ class PacketLogger {
                     Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${this._formatBits(payload[11])}
                     Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${this._formatBits(payload[12])}
                     Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${this._formatBits(payload[13])}`);
-	      */
-        }
-    }
 
-    _formatBits(byte) {
-        return byte.toString(2).padStart(8, '0').match(/.{1,4}/g).join(' ');
+            // Return an object with parsed header information
+            return {
+                streamId,
+                pesPacketLength,
+                randomAccessIndicator,
+                ptsDtsFlags,
+                pesHeaderLength,
+                // Add other fields as needed
+            };
+        }
+        return null;
     }
 
 	logDetailedStatsConditional(timeReceived, payload) {
@@ -466,6 +667,7 @@ class WebTransportLoader extends BaseLoader {
                 this.packetLogger.logPacket(packet, now);
 
                 if (this._onDataArrival) {
+                    //Log.v(this.TAG, `Sending chunk: ${packet.length} bytes at time ${Date.now()}`);
                     this._onDataArrival(packet, this._receivedLength - packet.length, this._receivedLength);
                 }
             }

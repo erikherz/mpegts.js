@@ -17,19 +17,19 @@
  */
 
 export const defaultConfig = {
-    enableWorker: false,
-    enableWorkerForMSE: false,
+    enableWorker: true,
+    enableWorkerForMSE: true,
     enableStashBuffer: true,
-    stashInitialSize: undefined,
+    stashInitialSize: 6016,
 
-    isLive: false,
+    isLive: true,
 
-    liveBufferLatencyChasing: false,
+    liveBufferLatencyChasing: true,
     liveBufferLatencyChasingOnPaused: false,
     liveBufferLatencyMaxLatency: 1.5,
     liveBufferLatencyMinRemain: 0.5,
 
-    liveSync: false,
+    liveSync: true,
     liveSyncMaxLatency: 1.2,
     liveSyncTargetLatency: 0.8,
     liveSyncPlaybackRate: 1.2,

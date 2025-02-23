@@ -438,6 +438,7 @@ class IOController {
     }
 
     _dispatchChunks(chunks, byteStart) {
+	    //Log.v(this.TAG, `IOController dispatching: length=${chunks.byteLength}, start=${byteStart}`);
         this._currentRange.to = byteStart + chunks.byteLength - 1;
         return this._onDataArrival(chunks, byteStart);
     }
@@ -456,22 +457,36 @@ class IOController {
         }
     }
 
-    _onLoaderChunkArrival(chunk, byteStart, receivedLength) {
-        if (!this._onDataArrival) {
-            throw new IllegalStateException('IOController: No existing consumer (onDataArrival) callback!');
-        }
-        if (this._paused) {
-            return;
-        }
-        if (this._isEarlyEofReconnecting) {
-            // Auto-reconnect for EarlyEof succeed, notify to upper-layer by callback
-            this._isEarlyEofReconnecting = false;
-            if (this._onRecoveredEarlyEof) {
-                this._onRecoveredEarlyEof();
-            }
-        }
+	_onLoaderChunkArrival(chunk, byteStart, receivedLength) {
+	    //Log.v(this.TAG, `>>> Chunk arrival: length=${chunk.byteLength}, start=${byteStart}, total=${receivedLength}`);
 
-        this._speedSampler.addBytes(chunk.byteLength);
+	    // Initial checks
+	    if (!this._onDataArrival) {
+		Log.e(this.TAG, '>>> No data arrival callback!');
+		throw new IllegalStateException('IOController: No existing consumer (onDataArrival) callback!');
+	    }
+	    if (this._paused) {
+		Log.w(this.TAG, '>>> Controller is paused');
+		return;
+	    }
+
+	    // Early EOF check
+	    if (this._isEarlyEofReconnecting) {
+		Log.v(this.TAG, '>>> Recovered from early EOF');
+		this._isEarlyEofReconnecting = false;
+		if (this._onRecoveredEarlyEof) {
+		    this._onRecoveredEarlyEof();
+		}
+	    }
+
+	    this._speedSampler.addBytes(chunk.byteLength);
+
+	    // Initial stash state
+	    //Log.v(this.TAG, `>>> Stash state before processing: 
+	    //	enabled=${this._enableStash}, 
+            //	used=${this._stashUsed}, 
+            //	size=${this._stashSize}, 
+            //	byteStart=${this._stashByteStart}`);
 
         // adjust stash buffer size according to network speed dynamically
         let KBps = this._speedSampler.lastSecondKBps;
@@ -517,14 +532,17 @@ class IOController {
         } else {  // enable stash
             if (this._stashUsed === 0 && this._stashByteStart === 0) {  // seeked? or init chunk?
                 // This is the first chunk after seek action
+		//Log.v(this.TAG, 'First chunk after seek');
                 this._stashByteStart = byteStart;
             }
             if (this._stashUsed + chunk.byteLength <= this._stashSize) {
+		//Log.v(this.TAG, `Stashing chunk: used=${this._stashUsed}, adding=${chunk.byteLength}, max=${this._stashSize}`);
                 // just stash
                 let stashArray = new Uint8Array(this._stashBuffer, 0, this._stashSize);
                 stashArray.set(new Uint8Array(chunk), this._stashUsed);
                 this._stashUsed += chunk.byteLength;
             } else {  // stashUsed + chunkSize > stashSize, size limit exceeded
+		//Log.v(this.TAG, `Stash full, dispatching: used=${this._stashUsed}, chunk=${chunk.byteLength}, max=${this._stashSize}`);
                 let stashArray = new Uint8Array(this._stashBuffer, 0, this._bufferSize);
                 if (this._stashUsed > 0) {  // There're stash datas in buffer
                     // dispatch the whole stashBuffer, and stash remain data
