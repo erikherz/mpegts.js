@@ -282,7 +282,9 @@ class PacketLogger {
 	}
 
 	_extractPTS(payload) {
+	    // Log detailed stats and PES header info (conditional)
 	    this.logDetailedStatsConditional(Date.now(), payload);
+
 	    // Ensure there is enough data and a valid PES start
 	    if (payload.length < 14) return null;
 	    if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) return null;
@@ -290,7 +292,7 @@ class PacketLogger {
 	    if (((payload[7] & 0xC0) >> 6) === 0) return null;
 
 	    // The five PTS bytes are located at indexes 9 to 13.
-	    // Their bit layout is as follows:
+	    // Bit layout:
 	    //   Byte 1: 4 bits constant (should be 0x2), 3 bits PTS[32..30], 1 marker bit (should be 1)
 	    //   Byte 2: 8 bits: PTS[29..22]
 	    //   Byte 3: 1 marker bit (should be 1), 7 bits: PTS[21..15]
@@ -302,12 +304,27 @@ class PacketLogger {
 	    const p3 = payload[12]; // e.g. 0x00
 	    const p4 = payload[13]; // e.g. 0x01
 
+	    // Log raw PTS bytes for debugging
+	    //this.onLog(`[WebTransportLoader] > Raw PTS bytes: ${[p0, p1, p2, p3, p4].map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+
 	    // Verify the fixed prefix in Byte 1 (upper 4 bits must equal 0x2)
-	    if ((p0 >> 4) !== 0x2) return null;
+	    if ((p0 >> 4) !== 0x2) {
+		this.onLog(`[WebTransportLoader] > Invalid PTS prefix in byte 1: 0x${p0.toString(16)}`);
+		return null;
+	    }
 	    // Verify marker bits: in Byte1, Byte3, and Byte5 the least-significant bit should be 1.
-	    if ((p0 & 0x01) !== 0x01) return null;
-	    if ((p2 & 0x01) !== 0x01) return null;
-	    if ((p4 & 0x01) !== 0x01) return null;
+	    if ((p0 & 0x01) !== 0x01) {
+		this.onLog(`[WebTransportLoader] > Marker bit error in byte 1.`);
+		return null;
+	    }
+	    if ((p2 & 0x01) !== 0x01) {
+		this.onLog(`[WebTransportLoader] > Marker bit error in byte 3.`);
+		return null;
+	    }
+	    if ((p4 & 0x01) !== 0x01) {
+		this.onLog(`[WebTransportLoader] > Marker bit error in byte 5.`);
+		return null;
+	    }
 
 	    // Now extract the 33-bit PTS:
 	    const pts =
@@ -316,6 +333,9 @@ class PacketLogger {
 		(((p2 >> 1) & 0x7F) << 15) | // Bits 21-15
 		(p3 << 7) |                 // Bits 14-7
 		((p4 >> 1) & 0x7F);          // Bits 6-0
+
+	    // Log the computed PTS value for additional debugging
+	    //this.onLog(`[WebTransportLoader] > Computed PTS: ${pts}`);
 
 	    // Conditional logging: only log for packet #1, #100, and every 1000th packet thereafter.
 	    if (this.packetCount === 1 || this.packetCount === 100 || this.packetCount % 1000 === 0) {
