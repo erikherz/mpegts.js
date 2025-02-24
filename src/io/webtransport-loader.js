@@ -733,6 +733,8 @@ class WebTransportLoader extends BaseLoader {
         // Bind methods
         this._readChunks = this._readChunks.bind(this);
         this._processPackets = this._processPackets.bind(this);
+	this.PACKETS_PER_CHUNK = 7;  
+        this._packetBuffer = [];
     }
 
     static isSupported() {
@@ -869,13 +871,48 @@ class WebTransportLoader extends BaseLoader {
                 this._receivedLength += packet.length;
                 this.packetLogger.logPacket(packet, now);
 
-                if (this._onDataArrival) {
-                    //Log.v(this.TAG, `Sending chunk: ${packet.length} bytes at time ${Date.now()}`);
-                    this._onDataArrival(packet, this._receivedLength - packet.length, this._receivedLength);
-                }
+            // Add to packet buffer instead of immediately dispatching
+            this._packetBuffer.push(packet);
+            
+            // When we have enough packets, dispatch them as a chunk
+            if (this._packetBuffer.length >= this.PACKETS_PER_CHUNK) {
+                this._dispatchPacketChunk();
+            }
+
+		    // PUSH EACH PACKET TO THE RENDERER
+            //    if (this._onDataArrival) {
+            //        //Log.v(this.TAG, `Sending chunk: ${packet.length} bytes at time ${Date.now()}`);
+            //        this._onDataArrival(packet, this._receivedLength - packet.length, this._receivedLength);
+            //    }
             }
         });
     }
+
+	_dispatchPacketChunk() {
+	    if (this._packetBuffer.length === 0) return;
+		
+	    // Combine packets into a single chunk
+	    const totalLength = this._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
+	    const chunk = new Uint8Array(totalLength);
+		
+	    let offset = 0;
+	    this._packetBuffer.forEach(packet => {
+		chunk.set(packet, offset);
+		offset += packet.length;
+	    });
+
+	    // Calculate byte positions
+	    const byteStart = this._receivedLength - totalLength;
+
+	    // Dispatch the combined chunk as ArrayBuffer (not Uint8Array)
+	    if (this._onDataArrival) {
+		Log.v(this.TAG, `Sending chunk: ${totalLength} bytes (${this._packetBuffer.length} packets) at time ${Date.now()}`);
+		this._onDataArrival(chunk.buffer, byteStart, this._receivedLength);
+	    }
+
+	    // Clear the buffer
+	    this._packetBuffer = [];
+	}
 
 	async _readChunks() {
 	    try {
@@ -946,6 +983,11 @@ class WebTransportLoader extends BaseLoader {
 			} else {
 			    Log.v(this.TAG, `No valid packets found in chunk of ${chunk.byteLength} bytes`);
 			}
+
+			if (this._packetBuffer.length > 0) {
+                           Log.v(this.TAG, `Flushing ${this._packetBuffer.length} remaining packets`);
+                           this._dispatchPacketChunk();
+                        }
 		    }
 		}
 	    } catch (e) {
