@@ -30,14 +30,13 @@
             border-radius: 4px;
         }
         .video-container {
-            margin: 20px 0;
+            margin: 0px 0;
             background: #000;
             border-radius: 4px;
             overflow: hidden;
         }
         .centeredVideo {
             width: 100%;
-            max-width: 1160px;
             margin: 0 auto;
             display: block;
         }
@@ -102,7 +101,9 @@
 
             const url = document.getElementById('sURL').value;
             const mediaDataSource = {
-                type: 'mpegts',
+                type: 'mse',
+		hasVideo: true,
+                hasAudio: true,
                 url: url,
                 isLive: true
             };

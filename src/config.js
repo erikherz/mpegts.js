@@ -20,26 +20,26 @@ export const defaultConfig = {
     enableWorker: true,
     enableWorkerForMSE: true,
     enableStashBuffer: true,
-    stashInitialSize: 6016,
+    stashInitialSize: 512000,
 
     isLive: true,
 
     liveBufferLatencyChasing: true,
     liveBufferLatencyChasingOnPaused: false,
-    liveBufferLatencyMaxLatency: 1.5,
-    liveBufferLatencyMinRemain: 0.5,
+    liveBufferLatencyMaxLatency: 3,
+    liveBufferLatencyMinRemain: 1.0,
 
     liveSync: true,
-    liveSyncMaxLatency: 1.2,
-    liveSyncTargetLatency: 0.8,
-    liveSyncPlaybackRate: 1.2,
+    liveSyncMaxLatency: 3.5,
+    liveSyncTargetLatency: 1.8,
+    liveSyncPlaybackRate: 1.1,
 
     lazyLoad: true,
     lazyLoadMaxDuration: 3 * 60,
     lazyLoadRecoverDuration: 30,
     deferLoadAfterSourceOpen: true,
 
-    // autoCleanupSourceBuffer: default as false, leave unspecified
+    autoCleanupSourceBuffer: true,
     autoCleanupMaxBackwardDuration: 3 * 60,
     autoCleanupMinBackwardDuration: 2 * 60,
 

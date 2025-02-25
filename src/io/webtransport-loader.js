@@ -18,6 +18,294 @@ import Log from '../utils/logger.js';
 import {BaseLoader, LoaderStatus, LoaderErrors} from './loader.js';
 import {RuntimeException} from '../utils/exception.js';
 
+class MPEGTSTestHarness {
+    constructor(options = {}) {
+        this.onLog = options.onLog || console.log;
+        this.TAG = 'MPEGTSTestHarness';
+        this.packetSize = 188;
+        this.validationResults = {
+            totalChunks: 0,
+            validChunks: 0,
+            totalPackets: 0,
+            validPackets: 0,
+            pidStats: new Map(),
+            pesPackets: 0,
+            validPTS: 0,
+            continuityErrors: 0,
+            alignmentErrors: 0,
+            structureErrors: 0
+        };
+
+        // Track continuity counters for each PID
+        this.continuityCounters = new Map();
+    }
+
+    reset() {
+        this.validationResults = {
+            totalChunks: 0,
+            validChunks: 0,
+            totalPackets: 0,
+            validPackets: 0,
+            pidStats: new Map(),
+            pesPackets: 0,
+            validPTS: 0,
+            continuityErrors: 0,
+            alignmentErrors: 0,
+            structureErrors: 0
+        };
+        this.continuityCounters = new Map();
+    }
+
+    // Process and validate a chunk of data
+    validateChunk(chunk) {
+        if (!chunk || !(chunk instanceof ArrayBuffer || chunk instanceof Uint8Array)) {
+            this.onLog(`${this.TAG}: Invalid chunk type`);
+            return false;
+        }
+
+        const data = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk;
+        this.validationResults.totalChunks++;
+
+        // Check if size is multiple of packet size
+        if (data.length % this.packetSize !== 0) {
+            this.onLog(`${this.TAG}: Chunk size (${data.length}) is not a multiple of ${this.packetSize}`);
+            this.validationResults.alignmentErrors++;
+            return false;
+        }
+
+        // Process each packet in the chunk
+        let allPacketsValid = true;
+        const packets = data.length / this.packetSize;
+
+        for (let i = 0; i < packets; i++) {
+            const packetOffset = i * this.packetSize;
+            const packetValid = this.validatePacket(data, packetOffset);
+
+            if (!packetValid) {
+                allPacketsValid = false;
+            }
+        }
+
+        if (allPacketsValid) {
+            this.validationResults.validChunks++;
+        }
+
+        return allPacketsValid;
+    }
+
+    // Validate a single MPEG-TS packet
+    validatePacket(data, offset) {
+        this.validationResults.totalPackets++;
+
+        // 1. Check sync byte
+        if (data[offset] !== 0x47) {
+            this.onLog(`${this.TAG}: Invalid sync byte at offset ${offset}: 0x${data[offset].toString(16)}`);
+            return false;
+        }
+
+        // 2. Extract basic packet information
+        const transportError = (data[offset + 1] & 0x80) !== 0;
+        const payloadStart = (data[offset + 1] & 0x40) !== 0;
+        const pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2];
+        const scramblingControl = (data[offset + 3] & 0xC0) >> 6;
+        const hasAdaptation = (data[offset + 3] & 0x20) !== 0;
+        const hasPayload = (data[offset + 3] & 0x10) !== 0;
+        const continuityCounter = data[offset + 3] & 0x0F;
+
+        // Update PID statistics
+        this.validationResults.pidStats.set(pid,
+            (this.validationResults.pidStats.get(pid) || 0) + 1);
+
+        // 3. Check for transport errors
+        if (transportError) {
+            this.onLog(`${this.TAG}: Transport error flag set at offset ${offset} for PID 0x${pid.toString(16)}`);
+            this.validationResults.structureErrors++;
+            return false;
+        }
+
+        // 4. Validate continuity counter
+        if (this.continuityCounters.has(pid)) {
+            const expectedCC = (this.continuityCounters.get(pid) + 1) & 0x0F;
+            if (continuityCounter !== expectedCC) {
+                this.onLog(`${this.TAG}: Continuity counter error for PID 0x${pid.toString(16)}: ` +
+                    `expected ${expectedCC}, got ${continuityCounter}`);
+                this.validationResults.continuityErrors++;
+            }
+        }
+        this.continuityCounters.set(pid, continuityCounter);
+
+        // 5. Validate adaptation field if present
+        if (hasAdaptation) {
+            const adaptationLength = data[offset + 4];
+
+            if (adaptationLength > 183) {
+                this.onLog(`${this.TAG}: Invalid adaptation field length ${adaptationLength} at offset ${offset}`);
+                this.validationResults.structureErrors++;
+                return false;
+            }
+        }
+
+        // 6. Check payload start indicator and PES header if applicable
+        if (payloadStart && hasPayload) {
+            this.validationResults.pesPackets++;
+
+            const payloadOffset = hasAdaptation ? offset + 5 + data[offset + 4] : offset + 4;
+
+            // Validate PES header if we have enough data
+            if (payloadOffset + 9 <= offset + this.packetSize) {
+                if (data[payloadOffset] === 0x00 &&
+                    data[payloadOffset + 1] === 0x00 &&
+                    data[payloadOffset + 2] === 0x01) {
+
+                    // Check for PTS
+                    if (payloadOffset + 14 <= offset + this.packetSize) {
+                        const ptsDtsFlags = (data[payloadOffset + 7] & 0xC0) >> 6;
+
+                        if (ptsDtsFlags > 0) {
+                            // Validate PTS marker bits
+                            const p0 = data[payloadOffset + 9];
+                            if ((p0 & 0xF0) >> 4 !== 0x2 && (p0 & 0xF0) >> 4 !== 0x3) {
+                                this.onLog(`${this.TAG}: Invalid PTS marker bits: 0x${p0.toString(16)}`);
+                            } else {
+                                this.validationResults.validPTS++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 7. All checks passed
+        this.validationResults.validPackets++;
+        return true;
+    }
+
+    // Generate a human-readable report
+    generateReport() {
+        const summary = `
+============ MPEG-TS Test Harness Report ============
+Total chunks processed: ${this.validationResults.totalChunks}
+Valid chunks: ${this.validationResults.validChunks} (${(this.validationResults.validChunks / this.validationResults.totalChunks * 100).toFixed(1)}%)
+Total packets: ${this.validationResults.totalPackets}
+Valid packets: ${this.validationResults.validPackets} (${(this.validationResults.validPackets / this.validationResults.totalPackets * 100).toFixed(1)}%)
+PES packets: ${this.validationResults.pesPackets}
+Valid PTS values: ${this.validationResults.validPTS}
+Continuity errors: ${this.validationResults.continuityErrors}
+Alignment errors: ${this.validationResults.alignmentErrors}
+Structure errors: ${this.validationResults.structureErrors}
+
+PID distribution:`;
+
+        let pidInfo = '';
+        for (const [pid, count] of this.validationResults.pidStats.entries()) {
+            pidInfo += `\n  PID 0x${pid.toString(16).padStart(4, '0')}: ${count} packets (${(count / this.validationResults.totalPackets * 100).toFixed(1)}%)`;
+
+            // Add interpretation for common PIDs
+            if (pid === 0x0000) {
+                pidInfo += " - Program Association Table (PAT)";
+            } else if (pid === 0x0001) {
+                pidInfo += " - Conditional Access Table (CAT)";
+            } else if (pid === 0x1FFF) {
+                pidInfo += " - Null packets";
+            } else if (pid === 0x1000 || pid === 0x0100 || pid === 0x4096) {
+                pidInfo += " - Likely Program Map Table (PMT)";
+            } else if (pid === 256 || pid === 0x1100 || pid === 0x0041) {
+                pidInfo += " - Video elementary stream";
+            } else if (pid === 257 || pid === 0x1200 || pid === 0x0043) {
+                pidInfo += " - Audio elementary stream";
+            }
+        }
+
+        // Add assessment of stream quality
+        let assessment = "\nOverall assessment: ";
+
+        if (this.validationResults.validPackets === 0) {
+            assessment += "CRITICAL - No valid packets found";
+        } else if (this.validationResults.validPackets / this.validationResults.totalPackets < 0.8) {
+            assessment += "POOR - Less than 80% of packets are valid";
+        } else if (this.validationResults.structureErrors > 0 || this.validationResults.alignmentErrors > 0) {
+            assessment += "PROBLEMATIC - Contains structural errors";
+        } else if (this.validationResults.continuityErrors > 0) {
+            assessment += "FAIR - Contains continuity errors but basic structure is valid";
+        } else if (!this.validationResults.pidStats.has(0x0000)) {
+            assessment += "INCOMPLETE - Missing Program Association Table (PAT)";
+        } else if (this.validationResults.validPTS === 0) {
+            assessment += "PROBLEMATIC - No valid PTS values found";
+        } else {
+            assessment += "GOOD - Stream appears to be well-formed";
+        }
+
+        // Add recommendations based on findings
+        let recommendations = "\n\nRecommendations:";
+
+        if (this.validationResults.alignmentErrors > 0) {
+            recommendations += "\n- Fix packet alignment by ensuring chunks are multiples of 188 bytes";
+            recommendations += "\n- Ensure sync bytes (0x47) occur at the start of each 188-byte packet";
+        }
+
+        if (this.validationResults.structureErrors > 0) {
+            recommendations += "\n- Check adaptation field lengths and packet structure";
+            recommendations += "\n- Verify PES header formation, especially for packets with payload_unit_start_indicator set";
+        }
+
+        if (this.validationResults.continuityErrors > 0) {
+            recommendations += "\n- Investigate packet loss or reordering in the transport layer";
+            recommendations += "\n- Ensure packets for each PID maintain proper continuity counter sequence";
+        }
+
+        if (!this.validationResults.pidStats.has(0x0000)) {
+            recommendations += "\n- Ensure PAT packets are included in the stream";
+        }
+
+        if (this.validationResults.validPTS === 0 && this.validationResults.pesPackets > 0) {
+            recommendations += "\n- Check PTS extraction logic and PES header formation";
+        }
+
+        return summary + pidInfo + assessment + recommendations;
+    }
+
+    // Integrate with your WebTransportLoader class
+    integrateWithLoader(loader) {
+        const originalDispatchMethod = loader._dispatchPacketChunk.bind(loader);
+
+        // Override the dispatch method to add validation
+        loader._dispatchPacketChunk = () => {
+            if (loader._packetBuffer.length === 0) return;
+
+            // Combine packets into a single chunk
+            const totalLength = loader._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
+            const chunk = new Uint8Array(totalLength);
+
+            let offset = 0;
+            loader._packetBuffer.forEach(packet => {
+                chunk.set(packet, offset);
+                offset += packet.length;
+            });
+
+            // Validate the chunk
+            const isValid = this.validateChunk(chunk.buffer);
+
+            if (!isValid) {
+                loader.onLog(`${this.TAG}: Invalid chunk detected, validation report follows:`);
+                loader.onLog(this.generateReport());
+            }
+
+            // Call the original method
+            originalDispatchMethod();
+        };
+
+	    if (typeof this.onLog === 'function') {
+		this.onLog(`${this.TAG}: Successfully integrated with WebTransportLoader`);
+	    } else if (typeof loader.onLog === 'function') {
+		loader.onLog(`${this.TAG}: Successfully integrated with WebTransportLoader`);
+	    } else {
+		console.log(`${this.TAG}: Successfully integrated with WebTransportLoader`);
+	    }
+
+        return true;
+    }
+}
+
 class TSPacketValidator {
     constructor(options = {}) {
         this.PACKET_SIZE = 188;
@@ -397,6 +685,19 @@ class PacketLogger {
         return byte.toString(2).padStart(8, '0');
     }
 
+	_detectPTSDiscontinuity(pts) {
+	    if (this.prevPTS !== null) {
+		const diff = pts - this.prevPTS;
+		// Check for large gaps or backwards jumps
+		if (Math.abs(diff) > 900000) { // 10-second gap
+		    Log.w(this.TAG, `Large PTS discontinuity detected: ${diff / 90000} seconds`);
+		    return true;
+		}
+	    }
+	    this.prevPTS = pts;
+	    return false;
+	}
+
 	logPacket(packet, timeReceived) {
 	    if (!packet || !(packet instanceof Uint8Array) || packet.length !== 188) {
 		return;
@@ -412,6 +713,17 @@ class PacketLogger {
 	    const payloadUnitStart = (packet[1] & 0x40) !== 0;
 	    const hasAdaptationField = (packet[3] & 0x20) !== 0;
 	    const hasPayload = (packet[3] & 0x10) !== 0;
+
+	if (this._checkForH264IFrame(payload, payloadOffset)) {
+	    //Log.v(this.TAG, `I-frame detected at PTS ${this.lastValidPTS}`);
+	    // Track keyframes for debugging
+	    if (!this.keyframes) this.keyframes = [];
+	    this.keyframes.push({
+		pts: this.lastValidPTS,
+		packetCount: this.packetCount,
+		timeReceived: Date.now()
+	    });
+	}
 
 	    if (pid === this.videoPID && hasPayload) {
 		this.debugStats.videoPIDPackets++;
@@ -476,8 +788,15 @@ class PacketLogger {
 
 	_checkForH264IFrame(payload, payloadOffset) {
 	    try {
-		// First check if we have the start of a PES packet
-		if (payload.length < 9) return false;
+		// First ensure payload is defined
+		if (!payload || !payload.length) {
+		    return false;
+		}
+		
+		// Check if we have the start of a PES packet
+		if (payload.length < 9) {
+		    return false;
+		}
 		
 		if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) {
 		    return false;
@@ -485,10 +804,16 @@ class PacketLogger {
 		
 		// Get to the actual video data after PES header
 		const pesHeaderLength = payload[8];
-		if (payload.length < 9 + pesHeaderLength + 5) return false;
+		if (pesHeaderLength === undefined || 
+		    payload.length < 9 + pesHeaderLength + 5) {
+		    return false;
+		}
 		
 		// Move to video data (after PES header)
 		const videoData = payload.slice(9 + pesHeaderLength);
+		if (!videoData || !videoData.length) {
+		    return false;
+		}
 		
 		// Look for NAL units (start with 0x000001 or 0x00000001)
 		for (let i = 0; i < videoData.length - 5; i++) {
@@ -498,11 +823,16 @@ class PacketLogger {
 			
 			// Get NAL type - 5 is IDR (I-frame)
 			const startCodeSize = (videoData[i+2] === 1) ? 3 : 4;
+			
+			// Make sure we have enough data for the NAL type
+			if (i + startCodeSize >= videoData.length) {
+			    continue;
+			}
+			
 			const nalType = videoData[i + startCodeSize] & 0x1F;
 			
 			// NAL type 5 = IDR (I-frame)
 			if (nalType === 5) {
-			    //this.onLog(`[INFO] H.264 I-frame detected at packet #${this.packetCount}`);
 			    return true;
 			}
 		    }
@@ -510,7 +840,7 @@ class PacketLogger {
 		
 		return false;
 	    } catch (e) {
-		this.onLog(`[ERROR] Error checking for I-frame: ${e.message}`);
+		Log.e(this.TAG, `Error checking for I-frame: ${e.message}`);
 		return false;
 	    }
 	}
@@ -730,6 +1060,7 @@ class WebTransportLoader extends BaseLoader {
         this._reader = null;
         this._requestAbort = false;
         this._receivedLength = 0;
+	this.debugCounter = 0;
 
         // Initialize with bound logging function
         const logFunction = (msg) => Log.v(this.TAG, msg);
@@ -739,8 +1070,12 @@ class WebTransportLoader extends BaseLoader {
         // Bind methods
         this._readChunks = this._readChunks.bind(this);
         this._processPackets = this._processPackets.bind(this);
-	this.PACKETS_PER_CHUNK = 7;  
+	this.PACKETS_PER_CHUNK = 15;  
         this._packetBuffer = [];
+
+	this.testHarness = new MPEGTSTestHarness({
+	    onLog: (msg) => { Log.v(this.TAG, msg); }
+	});
     }
 
     static isSupported() {
@@ -757,6 +1092,153 @@ class WebTransportLoader extends BaseLoader {
         }
         super.destroy();
     }
+
+	_handleBufferUnderrun() {
+	    Log.w(this.TAG, "Buffer underrun detected, attempting to recover");
+	    
+	    // Request higher priority for the next few chunks
+	    this.priorityMode = true;
+	    
+	    // Reset any potentially corrupted state
+	    this.tsBuffer = new MPEGTSBuffer((msg) => Log.v(this.TAG, msg));
+	    this.packetLogger = new PacketLogger((msg) => Log.v(this.TAG, msg));
+	    
+	    // Notify controller to prepare for discontinuity
+	    if (this._onRecoveryNeeded) {
+		this._onRecoveryNeeded();
+	    }
+	}
+
+	async validateTsChunkBeforeSending(chunk) {
+	    if (!chunk || chunk.byteLength === 0) {
+		Log.w(this.TAG, 'Empty chunk received, skipping validation');
+		return false;
+	    }
+
+	    const view = new Uint8Array(chunk);
+	    const packetSize = 188;
+	    
+	    // 1. Check if chunk size is a multiple of 188 bytes
+	    if (view.byteLength % packetSize !== 0) {
+		Log.e(this.TAG, `Chunk size (${view.byteLength}) is not a multiple of ${packetSize}, possible fragmentation`);
+		this._logHexDump(view, 0, Math.min(48, view.byteLength), 'Invalid chunk start');
+		return false;
+	    }
+	    
+	    // 2. Check if each packet starts with sync byte 0x47
+	    let validPackets = 0;
+	    let invalidPackets = 0;
+	    let pidCounts = new Map();
+	    
+	    for (let i = 0; i < view.byteLength; i += packetSize) {
+		if (view[i] !== 0x47) {
+		    invalidPackets++;
+		    Log.e(this.TAG, `Invalid sync byte at offset ${i}: 0x${view[i].toString(16)}`);
+		    this._logHexDump(view, i, Math.min(16, view.byteLength - i), 'Bad sync');
+		    continue;
+		}
+		
+		// Extract PID info
+		const pid = ((view[i + 1] & 0x1F) << 8) | view[i + 2];
+		pidCounts.set(pid, (pidCounts.get(pid) || 0) + 1);
+		
+		// Check continuity counter
+		const cc = view[i + 3] & 0x0F;
+		const hasPayload = (view[i + 3] & 0x10) !== 0;
+		const hasAdaptation = (view[i + 3] & 0x20) !== 0;
+		
+		// Check for adaptation field length validity if present
+		if (hasAdaptation) {
+		    if (i + 4 >= view.byteLength) {
+			Log.e(this.TAG, `Truncated packet at offset ${i}, missing adaptation field length`);
+			continue;
+		    }
+		    
+		    const adaptationLength = view[i + 4];
+		    if (adaptationLength > 183) {
+			Log.e(this.TAG, `Invalid adaptation field length ${adaptationLength} at offset ${i}`);
+			continue;
+		    }
+		}
+		
+		validPackets++;
+	    }
+	    
+	    // 3. Log validation summary
+	    const isValid = invalidPackets === 0 && validPackets > 0;
+	    
+	    /*
+	    Log.i(this.TAG, `Chunk validation: ${isValid ? 'VALID' : 'INVALID'} - ` + 
+		  `${validPackets} valid, ${invalidPackets} invalid, ${view.byteLength} bytes total`);
+            */
+	    
+	    // Log PID distribution
+	    if (validPackets > 0) {
+		let pidInfo = 'PIDs detected: ';
+		for (const [pid, count] of pidCounts.entries()) {
+		    pidInfo += `0x${pid.toString(16).padStart(4, '0')}(${count}) `;
+		}
+		//Log.d(this.TAG, pidInfo);
+	    }
+	    
+	    return isValid;
+	}
+
+	_logHexDump(data, offset, length, label) {
+	    const end = Math.min(offset + length, data.length);
+	    const bytes = [];
+	    const ascii = [];
+	    
+	    for (let i = offset; i < end; i++) {
+		const byte = data[i];
+		bytes.push(byte.toString(16).padStart(2, '0'));
+		// Add printable ASCII characters or a dot for non-printable
+		ascii.push(byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.');
+	    }
+	    
+	    //Log.d(this.TAG, `${label || 'Hex dump'} [${offset}-${end-1}]: ${bytes.join(' ')} | ${ascii.join('')}`);
+	}
+
+	_attemptToFixAlignment(chunk) {
+	    const view = new Uint8Array(chunk);
+	    
+	    // Find first sync byte
+	    let firstSyncIndex = -1;
+	    for (let i = 0; i < Math.min(view.byteLength, 500); i++) {
+		if (view[i] === 0x47) {
+		    // Check if we have multiple sync bytes at the expected interval
+		    let validSyncCount = 1;
+		    for (let j = 1; j <= 3; j++) {
+			const nextSyncPos = i + (j * 188);
+			if (nextSyncPos < view.byteLength && view[nextSyncPos] === 0x47) {
+			    validSyncCount++;
+			} else {
+			    break;
+			}
+		    }
+		    
+		    if (validSyncCount >= 2) {
+			firstSyncIndex = i;
+			break;
+		    }
+		}
+	    }
+	    
+	    if (firstSyncIndex === -1) {
+		Log.e(this.TAG, 'Could not find valid sync pattern in chunk');
+		return null;
+	    }
+	    
+	    if (firstSyncIndex === 0) {
+		// Alignment is correct
+		return chunk;
+	    }
+	    
+	    // Fix alignment by trimming
+	    Log.w(this.TAG, `Fixing alignment by trimming ${firstSyncIndex} bytes from start`);
+	    return view.slice(firstSyncIndex).buffer;
+	}
+
 
 	async diagnoseStream() {
 	    try {
@@ -824,6 +1306,8 @@ class WebTransportLoader extends BaseLoader {
 		Log.w(this.TAG, "Stream diagnosis indicates potential issues");
 	    }
 	});
+	this.testHarness.reset();
+        this.testHarness.integrateWithLoader(this);
         try {
             if (!dataSource.url.startsWith('https://')) {
                 throw new Error('WebTransport requires HTTPS URL');
@@ -847,6 +1331,10 @@ class WebTransportLoader extends BaseLoader {
 
             this._readChunks();
 
+            this.diagnosticTimer = setInterval(() => {
+               this.advancedStreamDiagnosis();
+            }, 10000); // Run diagnosis every 10 seconds
+
         } catch (e) {
             this._status = LoaderStatus.kError;
             if (this._onError) {
@@ -855,7 +1343,413 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
+	async advancedStreamDiagnosis() {
+	    // Create a diagnostic report
+	    Log.v(this.TAG, "========= MPEG-TS STREAM DIAGNOSTIC REPORT =========");
+	    
+	    // 1. WebTransport connection status
+	    Log.v(this.TAG, `WebTransport connection: ${this._transport && !this._transport.closed ? 'ACTIVE' : 'INACTIVE'}`);
+	    
+	    // 2. Received data statistics
+	    Log.v(this.TAG, `Total bytes received: ${this._receivedLength}`);
+	    
+	    // 3. Buffer statistics
+	    if (this.tsBuffer) {
+		Log.v(this.TAG, `TS Buffer statistics:`);
+		Log.v(this.TAG, `  Total packets processed: ${this.tsBuffer.stats.totalPacketsProcessed}`);
+		Log.v(this.TAG, `  Valid packets: ${this.tsBuffer.stats.validPackets}`);
+		Log.v(this.TAG, `  Invalid packets: ${this.tsBuffer.stats.invalidPackets}`);
+		Log.v(this.TAG, `  Invalid sync bytes: ${this.tsBuffer.stats.invalidSyncByteCount}`);
+		
+		// 4. Detailed PID statistics
+		//Log.v(this.TAG, "PID distribution:");
+		if (this.tsBuffer.stats.pidDistribution.size === 0) {
+		    Log.v(this.TAG, "  No PIDs detected");
+		} else {
+		    for (const [pid, count] of this.tsBuffer.stats.pidDistribution.entries()) {
+			const pidHex = pid.toString(16).padStart(4, '0');
+			Log.v(this.TAG, `  PID 0x${pidHex}: ${count} packets (${(count / this.tsBuffer.stats.validPackets * 100).toFixed(1)}%)`);
+			
+			// Add common PID interpretations
+			if (pid === 0x0000) {
+			    Log.v(this.TAG, "    - This is the Program Association Table (PAT)");
+			} else if (pid === 0x0001) {
+			    Log.v(this.TAG, "    - This is the Conditional Access Table (CAT)");
+			} else if (pid === 0x1FFF) {
+			    Log.v(this.TAG, "    - This is a Null packet");
+			} else if (pid >= 0x0002 && pid <= 0x000F) {
+			    Log.v(this.TAG, "    - Reserved PID");
+			} else if (pid === 0x0100 || pid === 0x1000) {
+			    Log.v(this.TAG, "    - Likely Program Map Table (PMT)");
+			} else if (pid === 0x0101 || pid === 0x1001) {
+			    Log.v(this.TAG, "    - Likely Network Information Table (NIT)");
+			} else if (pid >= 0x0100 && pid <= 0x01FF) {
+			    Log.v(this.TAG, "    - Likely PMT or other SI/PSI table");
+			} else if (pid === 0x0040 || pid === 0x0041 || pid === 0x0042) {
+			    Log.v(this.TAG, "    - Standard DVB video PID");
+			} else if (pid === 0x0043 || pid === 0x0044 || pid === 0x0045) {
+			    Log.v(this.TAG, "    - Standard DVB audio PID");
+			} else if ((pid >= 0x1100 && pid <= 0x11FF) || pid === 0x00E0) {
+			    Log.v(this.TAG, "    - Likely video elementary stream");
+			} else if ((pid >= 0x1200 && pid <= 0x12FF) || (pid >= 0x00C0 && pid <= 0x00DF)) {
+			    Log.v(this.TAG, "    - Likely audio elementary stream");
+			}
+		    }
+		}
+	    }
+	    
+	    // 5. PTS statistics
+	    if (this.packetLogger) {
+		Log.v(this.TAG, "PTS/timing statistics:");
+		Log.v(this.TAG, `  Video packets: ${this.packetLogger.debugStats.videoPIDPackets}`);
+		Log.v(this.TAG, `  PES packet starts: ${this.packetLogger.debugStats.pesStarts}`);
+		Log.v(this.TAG, `  Valid PTS found: ${this.packetLogger.debugStats.validPTS}`);
+		
+		if (this.packetLogger.debugStats.pts.length > 0) {
+		    const ptsValues = this.packetLogger.debugStats.pts;
+		    Log.v(this.TAG, `  Last PTS values: ${ptsValues.join(', ')}`);
+		    
+		    // Check for PTS discontinuities
+		    let discontinuities = 0;
+		    for (let i = 1; i < ptsValues.length; i++) {
+			const diff = ptsValues[i] - ptsValues[i-1];
+			if (diff < 0 || diff > 90000) { // More than 1 second gap
+			    discontinuities++;
+			}
+		    }
+		    
+		    if (discontinuities > 0) {
+			Log.v(this.TAG, `  WARNING: ${discontinuities} PTS discontinuities detected`);
+		    }
+		}
+	    }
+	    
+	    // 6. Attempt to extract and validate program information
+	    this._extractProgramInfo();
+	    
+	    // 7. Detect common MPEG-TS problems
+	    this._detectCommonProblems();
+	    
+	    Log.v(this.TAG, "==================================================");
+	}
+
+	// Extract and validate program information from the stream
+	_extractProgramInfo() {
+	    if (!this.tsBuffer || this.tsBuffer.stats.validPackets === 0) {
+		Log.v(this.TAG, "Program information cannot be extracted: No valid packets received");
+		return;
+	    }
+	    
+	    Log.v(this.TAG, "Program information analysis:");
+	    
+	    // Check if we've seen a PAT
+	    const hasPAT = this.tsBuffer.stats.pidDistribution.has(0x0000);
+	    if (!hasPAT) {
+		Log.v(this.TAG, "  WARNING: No Program Association Table (PAT) detected!");
+		Log.v(this.TAG, "  - This is critical for proper demuxing");
+		return;
+	    }
+	    
+	    // Check for likely PMT PIDs
+	    let foundPMT = false;
+	    for (const pid of this.tsBuffer.stats.pidDistribution.keys()) {
+		// Common PMT PIDs or those referenced in your logs
+		if (pid === 0x1000 || pid === 0x0100 || pid === 0x1001 || pid === 0x4096) {
+		    Log.v(this.TAG, `  Found potential PMT at PID 0x${pid.toString(16)}`);
+		    foundPMT = true;
+		}
+	    }
+	    
+	    if (!foundPMT) {
+		Log.v(this.TAG, "  WARNING: No Program Map Table (PMT) detected!");
+		Log.v(this.TAG, "  - PMT is required to identify audio/video streams");
+	    }
+	    
+	    // Look for video elementary streams
+	    let foundVideo = false;
+	    for (const pid of this.tsBuffer.stats.pidDistribution.keys()) {
+		// Common video PIDs from your code or those in standard ranges
+		if (pid === 0x0100 || pid === 0x0041 || pid === 0x00E0 || 
+		    pid === 256 || pid === 0x0042 || 
+		    (pid >= 0x1100 && pid <= 0x11FF)) {
+		    Log.v(this.TAG, `  Found potential video stream at PID 0x${pid.toString(16)}`);
+		    foundVideo = true;
+		}
+	    }
+	    
+	    if (!foundVideo) {
+		Log.v(this.TAG, "  WARNING: No video elementary streams detected!");
+	    }
+	    
+	    // Look for audio elementary streams
+	    let foundAudio = false;
+	    for (const pid of this.tsBuffer.stats.pidDistribution.keys()) {
+		// Common audio PIDs or those in standard ranges
+		if (pid === 0x0043 || pid === 0x0044 || pid === 257 ||
+		    (pid >= 0x1200 && pid <= 0x12FF) || 
+		    (pid >= 0x00C0 && pid <= 0x00DF)) {
+		    Log.v(this.TAG, `  Found potential audio stream at PID 0x${pid.toString(16)}`);
+		    foundAudio = true;
+		}
+	    }
+	    
+	    if (!foundAudio) {
+		Log.v(this.TAG, "  WARNING: No audio elementary streams detected!");
+	    }
+	    
+	    // Check based on your error logs' specific PIDs
+	    if (this.tsBuffer.stats.pidDistribution.has(256) && 
+		this.tsBuffer.stats.pidDistribution.has(257)) {
+		Log.v(this.TAG, "  Found PIDs matching your logs: 256 (video h264) and 257 (audio aac)");
+	    }
+	}
+
+	// Detect common MPEG-TS problems based on gathered statistics
+	_detectCommonProblems() {
+	    Log.v(this.TAG, "Common MPEG-TS problem detection:");
+	    
+	    let problems = 0;
+	    
+	    // 1. Check for sync byte issues
+	    if (this.tsBuffer && this.tsBuffer.stats.invalidSyncByteCount > 0) {
+		const badSyncPercentage = (this.tsBuffer.stats.invalidSyncByteCount / 
+					 (this.tsBuffer.stats.totalPacketsProcessed || 1) * 100).toFixed(2);
+		
+		Log.v(this.TAG, `  PROBLEM: ${this.tsBuffer.stats.invalidSyncByteCount} packets with invalid sync bytes (${badSyncPercentage}%)`);
+		Log.v(this.TAG, "  - This indicates corruption in the transport stream");
+		Log.v(this.TAG, "  - Check for network issues or packet loss in WebTransport");
+		problems++;
+	    }
+	    
+	    // 2. Check for packet size issues
+	    if (this._receivedLength % 188 !== 0) {
+		Log.v(this.TAG, `  PROBLEM: Total received bytes (${this._receivedLength}) is not a multiple of 188`);
+		Log.v(this.TAG, "  - This suggests packets are being fragmented or not properly aligned");
+		Log.v(this.TAG, "  - Ensure packets are aligned to 188-byte boundaries before sending to demuxer");
+		problems++;
+	    }
+	    
+	    // 3. Check for missing PAT/PMT
+	    if (!this.tsBuffer || !this.tsBuffer.stats.pidDistribution.has(0x0000)) {
+		Log.v(this.TAG, "  PROBLEM: Missing Program Association Table (PAT)");
+		Log.v(this.TAG, "  - This is crucial for the player to understand the stream structure");
+		Log.v(this.TAG, "  - Check if your stream source provides valid PAT");
+		problems++;
+	    }
+	    
+	    // 4. Check PES packets vs. PTS findings
+	    if (this.packetLogger && 
+		this.packetLogger.debugStats.pesStarts > 0 && 
+		this.packetLogger.debugStats.validPTS === 0) {
+		
+		Log.v(this.TAG, "  PROBLEM: Found PES packet starts but no valid PTS values");
+		Log.v(this.TAG, "  - This suggests malformed PES headers or timing information");
+		Log.v(this.TAG, "  - Check PES header format and PTS extraction logic");
+		problems++;
+	    }
+	    
+	    // 5. Check for missing video or audio PIDs based on error logs
+	    if (this.tsBuffer && 
+		!this.tsBuffer.stats.pidDistribution.has(256) && 
+		!this.tsBuffer.stats.pidDistribution.has(0x0100)) {
+		
+		Log.v(this.TAG, "  PROBLEM: Missing expected video PID (256/0x100)");
+		Log.v(this.TAG, "  - The player expects this PID based on your error logs");
+		Log.v(this.TAG, "  - Check if your stream uses a different PID for video");
+		problems++;
+	    }
+	    
+	    // 6. Check for mismatch between PMT and actual streams
+	    // This is a simplified check assuming common PIDs
+	    if (this.tsBuffer && 
+		this.tsBuffer.stats.pidDistribution.has(0x1000) && 
+		!this.tsBuffer.stats.pidDistribution.has(256) && 
+		!this.tsBuffer.stats.pidDistribution.has(257)) {
+		
+		Log.v(this.TAG, "  PROBLEM: PMT may be present but expected elementary streams are missing");
+		Log.v(this.TAG, "  - Check that PMT correctly references available elementary streams");
+		problems++;
+	    }
+	    
+	    // 7. Check for likely adaptation field issues
+	    if (this.tsBuffer && this.tsBuffer.stats.adaptationFieldCount === 0 && 
+		this.tsBuffer.stats.validPackets > 100) {
+		
+		Log.v(this.TAG, "  PROBLEM: No packets with adaptation fields found");
+		Log.v(this.TAG, "  - This is unusual for a normal MPEG-TS stream with video");
+		Log.v(this.TAG, "  - Could indicate non-standard encoding or stripped timing information");
+		problems++;
+	    }
+	    
+	    // 8. Check packet distribution to detect abnormalities
+	    if (this.tsBuffer && this.tsBuffer.stats.pidDistribution.size === 1) {
+		const pid = Array.from(this.tsBuffer.stats.pidDistribution.keys())[0];
+		Log.v(this.TAG, `  PROBLEM: Only one PID (0x${pid.toString(16)}) found in the stream`);
+		Log.v(this.TAG, "  - This is extremely unusual for a playable MPEG-TS stream");
+		Log.v(this.TAG, "  - Stream may be severely corrupted or not a valid MPEG-TS");
+		problems++;
+	    }
+	    
+	    // Summarize findings
+	    if (problems === 0) {
+		Log.v(this.TAG, "  No common MPEG-TS problems detected");
+	    } else {
+		Log.v(this.TAG, `  Total problems detected: ${problems}`);
+		Log.v(this.TAG, "  RECOMMENDATION: Enable detailed packet validation before sending to demuxer");
+	    }
+	}
+
+	collectSamplePackets(numPackets = 10) {
+	    if (!this._packetBuffer || this._packetBuffer.length === 0) {
+		Log.w(this.TAG, "No packets available to sample");
+		return null;
+	    }
+	    
+	    const samples = this._packetBuffer.slice(0, Math.min(numPackets, this._packetBuffer.length));
+	    
+	    Log.v(this.TAG, `Collected ${samples.length} sample packets for analysis`);
+	    
+	    // Create a detailed analysis of the sampled packets
+	    samples.forEach((packet, index) => {
+		if (!(packet instanceof Uint8Array) || packet.length !== 188) {
+		    Log.e(this.TAG, `Sample #${index}: INVALID PACKET (${packet ? packet.length : 'null'} bytes)`);
+		    return;
+		}
+		
+		// Basic packet info
+		const syncByte = packet[0];
+		const transportError = (packet[1] & 0x80) !== 0;
+		const payloadStart = (packet[1] & 0x40) !== 0;
+		const pid = ((packet[1] & 0x1F) << 8) | packet[2];
+		const hasAdaptation = (packet[3] & 0x20) !== 0;
+		const hasPayload = (packet[3] & 0x10) !== 0;
+		const continuityCounter = packet[3] & 0x0F;
+		
+		let info = `Sample #${index}: PID=0x${pid.toString(16).padStart(4, '0')} `;
+		info += `CC=${continuityCounter} `;
+		info += `Start=${payloadStart ? 'YES' : 'no'} `;
+		info += `Error=${transportError ? 'YES' : 'no'} `;
+		info += `Adapt=${hasAdaptation ? 'YES' : 'no'} `;
+		info += `Payload=${hasPayload ? 'YES' : 'no'}`;
+		
+		Log.v(this.TAG, info);
+		
+		// If this is a payload start, try to analyze the PES header
+		if (payloadStart && hasPayload) {
+		    this._analyzePESHeader(packet, hasAdaptation);
+		}
+		
+		// Log the first 16 bytes in hex for reference
+		this._logHexDump(packet, 0, Math.min(16, packet.length), `Sample #${index} header`);
+	    });
+	    
+	    return samples;
+	}
+
+	// Helper to analyze PES headers in packets
+	_analyzePESHeader(packet, hasAdaptation) {
+	    const payloadOffset = hasAdaptation ? 5 + packet[4] : 4;
+	    
+	    if (packet.length < payloadOffset + 9) {
+		Log.v(this.TAG, "  PES: Packet too short for PES header");
+		return;
+	    }
+	    
+	    // Check for PES start code
+	    if (packet[payloadOffset] !== 0x00 || 
+		packet[payloadOffset + 1] !== 0x00 || 
+		packet[payloadOffset + 2] !== 0x01) {
+		
+		Log.v(this.TAG, "  PES: Invalid start code");
+		return;
+	    }
+	    
+	    const streamId = packet[payloadOffset + 3];
+	    const pesLength = (packet[payloadOffset + 4] << 8) | packet[payloadOffset + 5];
+	    
+	    let streamType = "Unknown";
+	    if (streamId >= 0xE0 && streamId <= 0xEF) {
+		streamType = "Video";
+	    } else if (streamId >= 0xC0 && streamId <= 0xDF) {
+		streamType = "Audio";
+	    } else if (streamId === 0xBC) {
+		streamType = "Program Stream Map";
+	    } else if (streamId === 0xBE) {
+		streamType = "Padding Stream";
+	    } else if (streamId === 0xBF) {
+		streamType = "Private Stream 2";
+	    }
+	    
+	    Log.v(this.TAG, `  PES: ${streamType} stream (ID=0x${streamId.toString(16)}), Length=${pesLength}`);
+	    
+	    // Check for PTS if we have enough data
+	    if (packet.length >= payloadOffset + 14) {
+		const ptsDtsFlags = (packet[payloadOffset + 7] & 0xC0) >> 6;
+		
+		if (ptsDtsFlags > 0) {
+		    // Extract and display PTS bytes
+		    const ptsBytes = Array.from(packet.slice(payloadOffset + 9, payloadOffset + 14))
+			.map(b => b.toString(16).padStart(2, '0'))
+			.join(' ');
+		    
+		    Log.v(this.TAG, `  PES: PTS/DTS flags=${ptsDtsFlags}, PTS bytes=${ptsBytes}`);
+		    
+		    // Try to calculate actual PTS value
+		    try {
+			const p0 = packet[payloadOffset + 9];
+			const p1 = packet[payloadOffset + 10];
+			const p2 = packet[payloadOffset + 11];
+			const p3 = packet[payloadOffset + 12];
+			const p4 = packet[payloadOffset + 13];
+			
+			// Check if first bit marker is correct (should be '0010x' where x is a marker bit)
+			const prefix = (p0 >> 4) & 0x0F;
+			if ((prefix & 0x0E) !== 0x02) {
+			    Log.v(this.TAG, `  PES: Invalid PTS prefix (0x${prefix.toString(16)}), should be 0x2 or 0x3`);
+			}
+			
+			// Extract the 33-bit PTS
+			const pts = (((p0 >> 1) & 0x07) << 30) | 
+				   (p1 << 22) | 
+				   (((p2 >> 1) & 0x7F) << 15) | 
+				   (p3 << 7) | 
+				   ((p4 >> 1) & 0x7F);
+			
+			Log.v(this.TAG, `  PES: Calculated PTS=${pts} (${(pts/90000).toFixed(3)} seconds)`);
+		    } catch (e) {
+			Log.v(this.TAG, `  PES: Error calculating PTS: ${e.message}`);
+		    }
+		} else {
+		    Log.v(this.TAG, "  PES: No PTS/DTS flags set");
+		}
+	    }
+	}
+
+    getStreamQualityReport() {
+        return this.testHarness.generateReport();
+    }
+
+    getStreamHealthReport() {
+	    return {
+		testHarnessReport: this.testHarness.generateReport(),
+		receivedBytes: this._receivedLength,
+		packetStats: {
+		    total: this.tsBuffer.stats.totalPacketsProcessed,
+		    valid: this.tsBuffer.stats.validPackets,
+		    invalid: this.tsBuffer.stats.invalidPackets
+		},
+		ptsStats: {
+		    ptsFound: this.packetLogger.debugStats.validPTS,
+		    lastPTS: this.packetLogger.lastValidPTS
+		}
+	    };
+    }
+
     abort() {
+	if (this.diagnosticTimer) {
+           clearInterval(this.diagnosticTimer);
+           this.diagnosticTimer = null;
+        }   
         if (this._transport && !this._transport.closed) {
             this._requestAbort = true;
             if (this._reader) {
@@ -868,39 +1762,61 @@ class WebTransportLoader extends BaseLoader {
         this._status = LoaderStatus.kComplete;
     }
 
-    _processPackets(packets) {
-        if (!packets || !Array.isArray(packets)) return;
-
-        const now = Date.now();
-        packets.forEach(packet => {
-            if (packet instanceof Uint8Array) {
-                this._receivedLength += packet.length;
-                //this.packetLogger.logPacket(packet, now);
-
-            // Add to packet buffer instead of immediately dispatching
-            this._packetBuffer.push(packet);
-            
-            // When we have enough packets, dispatch them as a chunk
-            if (this._packetBuffer.length >= this.PACKETS_PER_CHUNK) {
-                this._dispatchPacketChunk();
-            }
-
-		    // PUSH EACH PACKET TO THE RENDERER
-            //    if (this._onDataArrival) {
-            //        //Log.v(this.TAG, `Sending chunk: ${packet.length} bytes at time ${Date.now()}`);
-            //        this._onDataArrival(packet, this._receivedLength - packet.length, this._receivedLength);
-            //    }
-            }
-        });
-    }
+	_processPackets(packets) {
+	    if (!packets || !Array.isArray(packets)) return;
+				    
+	    const now = Date.now();
+	    let validPackets = [];
+	    
+	    packets.forEach(packet => {
+		if (packet instanceof Uint8Array && packet.length === 188) {
+		    // Validate individual packet
+		    if (packet[0] !== 0x47) {
+			Log.e(this.TAG, 'Invalid sync byte in packet, skipping');
+			return; // Skip invalid packet
+		    }
+		    
+		    this._receivedLength += packet.length;
+		    this.packetLogger.logPacket(packet, now);
+		    validPackets.push(packet);
+		} else {
+		    Log.e(this.TAG, `Invalid packet format or length: ${packet ? packet.length : 'null'}`);
+		}
+	    });
+	    
+	    // Track error rate
+	    if (validPackets.length === 0 && packets.length > 0) {
+		this.consecutiveErrors = (this.consecutiveErrors || 0) + 1;
+		if (this.consecutiveErrors > 5) {
+		    Log.e(this.TAG, "Too many consecutive errors, attempting recovery");
+		    this._handleBufferUnderrun();
+		    this.consecutiveErrors = 0;
+		}
+	    } else if (validPackets.length > 0) {
+		this.consecutiveErrors = 0;
+	    }
+	    
+	    // Only add valid packets to the buffer
+	    if (validPackets.length > 0) {
+		// Update the last packet time for heartbeat checking
+		this.lastPacketTime = Date.now();
+		
+		this._packetBuffer.push(...validPackets);
+		
+		// When we have enough packets, dispatch them as a chunk
+		if (this._packetBuffer.length >= this.PACKETS_PER_CHUNK) {
+		    this._dispatchPacketChunk();
+		}
+	    }
+	}
 
 	_dispatchPacketChunk() {
 	    if (this._packetBuffer.length === 0) return;
-		
+	    
 	    // Combine packets into a single chunk
 	    const totalLength = this._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
 	    const chunk = new Uint8Array(totalLength);
-		
+	    
 	    let offset = 0;
 	    this._packetBuffer.forEach(packet => {
 		chunk.set(packet, offset);
@@ -910,9 +1826,22 @@ class WebTransportLoader extends BaseLoader {
 	    // Calculate byte positions
 	    const byteStart = this._receivedLength - totalLength;
 
-	    // Dispatch the combined chunk as ArrayBuffer (not Uint8Array)
-	    if (this._onDataArrival) {
-		//Log.v(this.TAG, `Sending chunk: ${totalLength} bytes (${this._packetBuffer.length} packets) at time ${Date.now()}`);
+	    // Validate the chunk before sending
+	    const isValid = this.validateTsChunkBeforeSending(chunk.buffer);
+	    
+	    if (!isValid) {
+		Log.e(this.TAG, `Invalid TS chunk detected, may cause demuxer errors. Attempting to fix...`);
+		// Try to fix alignment issues
+		const fixedChunk = this._attemptToFixAlignment(chunk.buffer);
+		if (fixedChunk) {
+		    //Log.v(this.TAG, `Sending fixed chunk: ${fixedChunk.byteLength} bytes`);
+		    this._onDataArrival(fixedChunk, byteStart, this._receivedLength);
+		} else {
+		    Log.e(this.TAG, `Could not fix chunk, skipping`);
+		}
+	    } else {
+		// Dispatch the valid chunk
+		//Log.v(this.TAG, `Sending valid chunk: ${totalLength} bytes (${this._packetBuffer.length} packets)`);
 		this._onDataArrival(chunk.buffer, byteStart, this._receivedLength);
 	    }
 
@@ -920,10 +1849,41 @@ class WebTransportLoader extends BaseLoader {
 	    this._packetBuffer = [];
 	}
 
+		_findAlignedSyncByte(buffer) {
+	    // Look for a pattern of sync bytes at 188-byte intervals
+	    for (let i = 0; i <= buffer.length - 188*2; i++) {
+		if (buffer[i] === 0x47) {
+		    // Check if we have multiple sync bytes at the expected interval
+		    let validSyncCount = 1;
+		    for (let j = 1; j <= 3; j++) {
+			const nextSyncPos = i + (j * 188);
+			if (nextSyncPos < buffer.length && buffer[nextSyncPos] === 0x47) {
+			    validSyncCount++;
+			} else {
+			    break;
+			}
+		    }
+
+		    // If we found at least 2 consecutive sync bytes at 188-byte intervals
+		    if (validSyncCount >= 2) {
+			return i;
+		    }
+		}
+	    }
+
+	    // Fallback: return the first sync byte we find
+	    for (let i = 0; i < buffer.length; i++) {
+		if (buffer[i] === 0x47) {
+		    return i;
+		}
+	    }
+
+	    return -1;
+	}
+
 	async _readChunks() {
 	    try {
-		let fragmentBuffer = new Uint8Array(0);
-		this._lastChunkSize = 0;
+		let pendingData = new Uint8Array(0);
 		let debugCounter = 0;
 
 		while (true) {
@@ -932,79 +1892,79 @@ class WebTransportLoader extends BaseLoader {
 		    const { value, done } = await this._reader.read();
 		    if (done) {
 			//Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
+			// Process any remaining valid data
+			if (pendingData.length >= 188) {
+			    const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
+			    const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
+			    if (packets) {
+				this._processPackets(packets);
+			    }
+			}
 			break;
 		    }
 
 		    if (value) {
 			let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-			
-			// Debug log every 20 chunks
 			debugCounter++;
-			if (debugCounter % 20 === 0 || chunk.byteLength < 100) {
-			    //Log.v(this.TAG, `Received chunk #${debugCounter}: ${chunk.byteLength} bytes, total: ${this._receivedLength + chunk.byteLength} bytes`);
+			
+			// Combine with any pending data from previous chunks
+			if (pendingData.length > 0) {
+			    const newBuffer = new Uint8Array(pendingData.length + chunk.length);
+			    newBuffer.set(pendingData, 0);
+			    newBuffer.set(chunk, pendingData.length);
+			    chunk = newBuffer;
+			    pendingData = new Uint8Array(0);
+			}
+			
+			// Find and align to the first valid sync byte pattern
+			const syncIndex = this._findAlignedSyncByte(chunk);
+			
+			if (syncIndex === -1) {
+			    // No valid pattern found, store the chunk for next iteration
+			    pendingData = chunk;
+			    Log.w(this.TAG, `No valid sync pattern found in chunk (${chunk.length} bytes)`);
+			    continue;
+			} else if (syncIndex > 0) {
+			    // Skip data before the first valid sync byte
+			    chunk = chunk.slice(syncIndex);
+			    Log.d(this.TAG, `Aligned to sync byte at offset ${syncIndex}`);
+			}
+			
+			// Process only complete 188-byte packets
+			const validLength = Math.floor(chunk.length / 188) * 188;
+			
+			if (validLength > 0) {
+			    const validChunk = chunk.slice(0, validLength);
+			    const packets = this.tsBuffer.addChunk(validChunk);
 			    
-			    // Log first few bytes for debugging
-			    if (chunk.byteLength > 0) {
-				const hexBytes = Array.from(chunk.slice(0, Math.min(16, chunk.byteLength)))
-				    .map(b => b.toString(16).padStart(2, '0'))
-				    .join(' ');
-				// Log.v(this.TAG, `First bytes: ${hexBytes}`);
+			    if (packets) {
+				//Log.v(this.TAG, `Processing ${packets.length} valid packets from ${validLength} bytes`);
+				this._processPackets(packets);
+			    } else {
+				Log.w(this.TAG, `Failed to extract valid packets from ${validLength} bytes`);
 			    }
 			}
-
-			// Handle fragment from previous chunk
-			if (fragmentBuffer.length > 0) {
-			    //Log.v(this.TAG, `Merging fragment buffer (${fragmentBuffer.length} bytes) with new chunk`);
-			    let merged = new Uint8Array(fragmentBuffer.length + chunk.length);
-			    merged.set(fragmentBuffer, 0);
-			    merged.set(chunk, fragmentBuffer.length);
-			    chunk = merged;
-			    fragmentBuffer = new Uint8Array(0);
+			
+			// Store any remaining partial packet for the next chunk
+			if (validLength < chunk.length) {
+			    pendingData = chunk.slice(validLength);
+			    //Log.d(this.TAG, `Storing ${pendingData.length} bytes for next chunk`);
 			}
-
-			// Check if we have a sync byte at the start
-			if (chunk.length > 0 && chunk[0] !== 0x47) {
-			    // Try to find first sync byte
-			    let syncIndex = -1;
-			    for (let i = 0; i < Math.min(chunk.length, 1000); i++) {
-				if (chunk[i] === 0x47) {
-				    syncIndex = i;
-				    break;
-				}
-			    }
-			    
-			    if (syncIndex > 0) {
-				//Log.v(this.TAG, `Found sync byte at offset ${syncIndex}, trimming chunk`);
-				chunk = chunk.slice(syncIndex);
-			    } else if (syncIndex === -1) {
-				Log.v(this.TAG, `No sync byte found in first 1000 bytes, skipping chunk`);
-				continue;
-			    }
-			}
-
-			const packets = this.tsBuffer.addChunk(chunk);
-			if (packets) {
-			    //Log.v(this.TAG, `Processing ${packets.length} valid packets from chunk`);
-			    this._processPackets(packets);
-			} else {
-			    Log.v(this.TAG, `No valid packets found in chunk of ${chunk.byteLength} bytes`);
-			}
-
-			if (this._packetBuffer.length > 0) {
-                           //Log.v(this.TAG, `Flushing ${this._packetBuffer.length} remaining packets`);
-                           this._dispatchPacketChunk();
-                        }
 		    }
 		}
+		
+		// Flush any remaining packets
+		if (this._packetBuffer.length > 0) {
+		    this._dispatchPacketChunk();
+		}
+		
 	    } catch (e) {
 		Log.e(this.TAG, `Error in _readChunks: ${e.message}`);
-		Log.e(this.TAG, e.stack);  // Log the stack trace for more information
+		Log.e(this.TAG, e.stack);
 		this._status = LoaderStatus.kError;
 		if (this._onError) {
 		    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
 		}
-	    } finally {
-		//Log.v(this.TAG, `_readChunks ended after processing ${this._receivedLength} bytes`);
 	    }
 	}
 }
