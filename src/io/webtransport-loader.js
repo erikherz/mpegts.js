@@ -99,19 +99,19 @@ isLikelyValidPacketStart(buffer, index) {
         const bytes = Array.from(buffer.slice(start, start + length))
             .map(b => b.toString(16).padStart(2, '0'))
             .join(' ');
-        this.onLog(`[RAW] Bytes at ${start}: ${bytes}`);
+        //this.onLog(`[RAW] Bytes at ${start}: ${bytes}`);
     }
 
     logVideoPacketDetails(buffer, index, payloadStart, hasAdaptationField, continuityCounter) {
         const payloadOffset = hasAdaptationField ? 5 + buffer[index + 4] : 4;
 
-        this.onLog(`[DEBUG] Video packet at ${index}: START=${payloadStart}, AF=${hasAdaptationField}, CC=${continuityCounter}`);
+        //this.onLog(`[DEBUG] Video packet at ${index}: START=${payloadStart}, AF=${hasAdaptationField}, CC=${continuityCounter}`);
 
         if (payloadStart && buffer.length >= index + payloadOffset + 4) {
             const startCode = buffer.slice(index + payloadOffset, index + payloadOffset + 4);
             if (startCode[0] === 0x00 && startCode[1] === 0x00 &&
                 startCode[2] === 0x00 && startCode[3] === 0x01) {
-                this.onLog(`[DEBUG] Valid H.264 start code found at offset ${payloadOffset}`);
+                //this.onLog(`[DEBUG] Valid H.264 start code found at offset ${payloadOffset}`);
             }
         }
     }
@@ -144,7 +144,7 @@ class MPEGTSBuffer {
         const inputChunk = (chunk instanceof Uint8Array) ? chunk : new Uint8Array(chunk);
 
         // Log incoming chunk details
-        this.onLog(`Processing new chunk of ${inputChunk.length} bytes`);
+        //this.onLog(`Processing new chunk of ${inputChunk.length} bytes`);
 
         // Append new data to existing buffer
         let newBuffer = new Uint8Array(this.buffer.length + inputChunk.length);
@@ -153,7 +153,7 @@ class MPEGTSBuffer {
         this.buffer = newBuffer;
 
         // Log buffer state
-        this.onLog(`Total buffer size after append: ${this.buffer.length} bytes`);
+        //this.onLog(`Total buffer size after append: ${this.buffer.length} bytes`);
 
         // Find first valid sync byte
         let syncIndex = this.findSyncByte(this.buffer);
@@ -187,7 +187,7 @@ class MPEGTSBuffer {
 		for (let i = 0; i < packets.length; i += this.PACKET_SIZE) {
 		    // Ensure we have enough bytes for a complete packet
 		    if (i + this.PACKET_SIZE > packets.length) {
-			this.onLog(`[WARNING] Incomplete packet at end of buffer: ${packets.length - i} bytes`);
+			//this.onLog(`[WARNING] Incomplete packet at end of buffer: ${packets.length - i} bytes`);
 			break;
 		    }
 		    
@@ -233,7 +233,7 @@ class MPEGTSBuffer {
 				    const ptsBytes = Array.from(currentPacket.slice(payloadOffset + 9, payloadOffset + 14))
 					.map(b => b.toString(16).padStart(2, '0'))
 					.join(' ');
-				    this.onLog(`[DEBUG] PTS bytes for PID ${pid.toString(16)}: ${ptsBytes}`);
+				    //this.onLog(`[DEBUG] PTS bytes for PID ${pid.toString(16)}: ${ptsBytes}`);
 				}
 			    }
 			}
@@ -246,10 +246,10 @@ class MPEGTSBuffer {
 		if (this.stats.totalPacketsProcessed % 1000 === 0) {
 		    try {
 			if (typeof this.logStats === 'function') {
-			    this.logStats();
+			    //this.logStats();
 			} else {
 			    // Fallback minimal logging
-			    this.onLog(`MPEGTS Buffer Stats: Total=${this.stats.totalPacketsProcessed}, Valid=${this.stats.validPackets}`);
+			    // this.onLog(`MPEGTS Buffer Stats: Total=${this.stats.totalPacketsProcessed}, Valid=${this.stats.validPackets}`);
 			}
 		    } catch (e) {
 			this.onLog(`[ERROR] Error logging stats: ${e.message}`);
@@ -282,7 +282,7 @@ class MPEGTSBuffer {
 		    
 		    // If we found at least 2 sync bytes at the right spacing, it's likely a valid start
 		    if (validSyncCount >= 2) {
-			this.onLog(`[INFO] Found ${validSyncCount} consecutive sync bytes at position ${i}`);
+			//this.onLog(`[INFO] Found ${validSyncCount} consecutive sync bytes at position ${i}`);
 			return i;
 		    }
 		}
@@ -291,7 +291,7 @@ class MPEGTSBuffer {
 	    // Fallback: return the first sync byte we find, even if it doesn't have follow-ups
 	    for (let i = 0; i <= buffer.length - this.PACKET_SIZE; i++) {
 		if (buffer[i] === this.SYNC_BYTE) {
-		    this.onLog(`[INFO] Found single sync byte at position ${i} (no follow-ups)`);
+		    //this.onLog(`[INFO] Found single sync byte at position ${i} (no follow-ups)`);
 		    return i;
 		}
 	    }
@@ -337,6 +337,7 @@ class PacketLogger {
 	    
 	    const [p0, p1, p2, p3, p4] = rawBytes;
 	    
+		/*
 	    this.onLog(`
 	PTS Breakdown:
 	=============
@@ -384,7 +385,7 @@ class PacketLogger {
 	  (p3 << 7) | 
 	  (((p4 | 0x01) >> 1) & 0x7F)}
 	`);
-
+*/
 	    return (((p0 >> 1) & 0x07) << 30) | 
 		   (p1 << 22) | 
 		   (((p2 >> 1) & 0x7F) << 15) | 
@@ -430,7 +431,7 @@ class PacketLogger {
 			randomAccessIndicator = (adaptationFlags & 0x40) >> 6;
 			
 			if (randomAccessIndicator === 1) {
-			    this.onLog(`[INFO] Random Access Indicator found at packet #${this.packetCount}`);
+			    //this.onLog(`[INFO] Random Access Indicator found at packet #${this.packetCount}`);
 			}
 		    }
 		    
@@ -462,14 +463,14 @@ class PacketLogger {
 			    this.debugStats.pts.shift();
 			}
 			
-			this.onLog(`[INFO] Found PTS: ${pts} in video packet #${this.debugStats.videoPIDPackets}`);
+			//this.onLog(`[INFO] Found PTS: ${pts} in video packet #${this.debugStats.videoPIDPackets}`);
 		    }
 		}
 	    }
 
 	    if (this.packetCount === 1 || this.packetCount === 100 || 
 		this.packetCount === 1000 || this.packetCount % 1000 === 0) {
-		this._logDetailedStats(timeReceived);
+		//this._logDetailedStats(timeReceived);
 	    }
 	}
 
@@ -501,7 +502,7 @@ class PacketLogger {
 			
 			// NAL type 5 = IDR (I-frame)
 			if (nalType === 5) {
-			    this.onLog(`[INFO] H.264 I-frame detected at packet #${this.packetCount}`);
+			    //this.onLog(`[INFO] H.264 I-frame detected at packet #${this.packetCount}`);
 			    return true;
 			}
 		    }
@@ -534,6 +535,7 @@ class PacketLogger {
 		const pesExtensionFlag = payload[7] & 0x01;
 		const pesHeaderLength = payload[8];
 
+		    /*
 		this.onLog(`PES Header Detailed Debug:
 		    Start Code: ${payload[0]},${payload[1]},${payload[2]}
 		    Stream ID: 0x${streamId.toString(16)}
@@ -559,6 +561,8 @@ class PacketLogger {
 			Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${this._formatBits(payload[11])}
 			Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${this._formatBits(payload[12])}
 			Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${this._formatBits(payload[13])}`);
+
+		     */
 
 		// Return an object with parsed header information
 		return {
@@ -590,7 +594,7 @@ class PacketLogger {
 		statsMsg += `            Not PES Header: ${this.debugStats.notPESHeader}\n`;
 		statsMsg += `            No PTS: ${this.debugStats.noPTS}\n`;
 		statsMsg += `            Last 5 PTS values: ${this.debugStats.pts.join(', ')}\n`;
-		this.onLog(statsMsg);
+		//this.onLog(statsMsg);
 
 		// Log PES Header Detailed Debug if the payload is available.
 		if (payload && payload.length >= 14) {
@@ -618,14 +622,14 @@ class PacketLogger {
 		    headerMsg += `                    Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${payload[11].toString(2).padStart(8, '0')}\n`;
 		    headerMsg += `                    Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${payload[12].toString(2).padStart(8, '0')}\n`;
 		    headerMsg += `                    Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${payload[13].toString(2).padStart(8, '0')}\n`;
-		    this.onLog(headerMsg);
+		    //this.onLog(headerMsg);
 		}
 	    }
 	}
 
 	_extractPTS(payload) {
 	    // Log detailed stats and PES header info (conditional)
-	    this.logDetailedStatsConditional(Date.now(), payload);
+	    //this.logDetailedStatsConditional(Date.now(), payload);
 
 	    // Ensure there is enough data and a valid PES start
 	    if (payload.length < 14) {
@@ -659,7 +663,7 @@ class PacketLogger {
 
 	    // Log raw PTS bytes for debugging
 	    const hexBytes = [p0, p1, p2, p3, p4].map(b => b.toString(16).padStart(2, '0')).join(' ');
-	    this.onLog(`[DEBUG] Raw PTS bytes: ${hexBytes}`);
+	    //this.onLog(`[DEBUG] Raw PTS bytes: ${hexBytes}`);
 	    
 	    // Extract the 33-bit PTS, handling marker bits correctly
 	    const pts =
@@ -670,7 +674,7 @@ class PacketLogger {
 		((p4 >> 1) & 0x7F);          // Bits 6-0
 
 	    // Log the computed PTS value
-	    this.onLog(`[INFO] Extracted PTS: ${pts} from bytes: ${hexBytes}`);
+	    //this.onLog(`[INFO] Extracted PTS: ${pts} from bytes: ${hexBytes}`);
 	    
 	    // Update statistics
 	    this.debugStats.validPTS++;
@@ -689,7 +693,7 @@ class PacketLogger {
             const ptsDrop = this.lastValidPTS - pts;
             if (ptsDrop > 4294967296) {
                 this.wraparoundOffset += 8589934592;
-                this.onLog(`PTS wraparound detected! New offset: ${this.wraparoundOffset}`);
+                //this.onLog(`PTS wraparound detected! New offset: ${this.wraparoundOffset}`);
             }
             pts += this.wraparoundOffset;
         }
@@ -701,6 +705,7 @@ class PacketLogger {
                    this.lastValidPTS : 
                    (this.packetCount * this.estimatedFrameDuration);
 
+	    /*
         this.onLog(`Packet Stats #${this.packetCount}:
             PTS: ${pts}
             Received at: ${timeReceived}
@@ -711,6 +716,7 @@ class PacketLogger {
             Not PES Header: ${this.debugStats.notPESHeader}
             No PTS: ${this.debugStats.noPTS}
             Last 5 PTS values: ${this.debugStats.pts.join(', ')}`);
+	    */
     }
 }
 
@@ -754,7 +760,7 @@ class WebTransportLoader extends BaseLoader {
 
 	async diagnoseStream() {
 	    try {
-		Log.v(this.TAG, "Starting stream diagnosis...");
+		//Log.v(this.TAG, "Starting stream diagnosis...");
 		
 		// 1. Check if WebTransport is properly supported
 		if (!WebTransportLoader.isSupported()) {
@@ -763,7 +769,7 @@ class WebTransportLoader extends BaseLoader {
 		}
 		
 		// 2. Compare with a known working stream (if available)
-		Log.v(this.TAG, "Suggestion: Try a known working MPEG-TS stream for comparison");
+		//Log.v(this.TAG, "Suggestion: Try a known working MPEG-TS stream for comparison");
 		
 		// 3. Check if we're receiving any data
 		if (this._receivedLength === 0) {
@@ -773,15 +779,15 @@ class WebTransportLoader extends BaseLoader {
 		
 		// 4. Check if we've found valid TS packets
 		if (this.tsBuffer.stats.validPackets === 0) {
-		    Log.e(this.TAG, "No valid TS packets found in the received data");
-		    Log.v(this.TAG, "This could indicate a non-MPEG-TS stream or corrupted data");
+		    //Log.e(this.TAG, "No valid TS packets found in the received data");
+		    //Log.v(this.TAG, "This could indicate a non-MPEG-TS stream or corrupted data");
 		    return false;
 		}
 		
 		// 5. Report on PIDs found
-		Log.v(this.TAG, "PIDs found in the stream:");
+		//Log.v(this.TAG, "PIDs found in the stream:");
 		for (const [pid, count] of this.tsBuffer.stats.pidDistribution.entries()) {
-		    Log.v(this.TAG, `  PID 0x${pid.toString(16).padStart(4, '0')}: ${count} packets`);
+		    //Log.v(this.TAG, `  PID 0x${pid.toString(16).padStart(4, '0')}: ${count} packets`);
 		}
 		
 		// 6. Check for expected PIDs
@@ -804,7 +810,7 @@ class WebTransportLoader extends BaseLoader {
 		    return false;
 		}
 		
-		Log.v(this.TAG, "Stream diagnosis complete - found valid data with PTS values");
+		//Log.v(this.TAG, "Stream diagnosis complete - found valid data with PTS values");
 		return true;
 	    } catch (e) {
 		Log.e(this.TAG, `Error during diagnosis: ${e.message}`);
@@ -869,7 +875,7 @@ class WebTransportLoader extends BaseLoader {
         packets.forEach(packet => {
             if (packet instanceof Uint8Array) {
                 this._receivedLength += packet.length;
-                this.packetLogger.logPacket(packet, now);
+                //this.packetLogger.logPacket(packet, now);
 
             // Add to packet buffer instead of immediately dispatching
             this._packetBuffer.push(packet);
@@ -906,7 +912,7 @@ class WebTransportLoader extends BaseLoader {
 
 	    // Dispatch the combined chunk as ArrayBuffer (not Uint8Array)
 	    if (this._onDataArrival) {
-		Log.v(this.TAG, `Sending chunk: ${totalLength} bytes (${this._packetBuffer.length} packets) at time ${Date.now()}`);
+		//Log.v(this.TAG, `Sending chunk: ${totalLength} bytes (${this._packetBuffer.length} packets) at time ${Date.now()}`);
 		this._onDataArrival(chunk.buffer, byteStart, this._receivedLength);
 	    }
 
@@ -925,7 +931,7 @@ class WebTransportLoader extends BaseLoader {
 		    
 		    const { value, done } = await this._reader.read();
 		    if (done) {
-			Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
+			//Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
 			break;
 		    }
 
@@ -935,20 +941,20 @@ class WebTransportLoader extends BaseLoader {
 			// Debug log every 20 chunks
 			debugCounter++;
 			if (debugCounter % 20 === 0 || chunk.byteLength < 100) {
-			    Log.v(this.TAG, `Received chunk #${debugCounter}: ${chunk.byteLength} bytes, total: ${this._receivedLength + chunk.byteLength} bytes`);
+			    //Log.v(this.TAG, `Received chunk #${debugCounter}: ${chunk.byteLength} bytes, total: ${this._receivedLength + chunk.byteLength} bytes`);
 			    
 			    // Log first few bytes for debugging
 			    if (chunk.byteLength > 0) {
 				const hexBytes = Array.from(chunk.slice(0, Math.min(16, chunk.byteLength)))
 				    .map(b => b.toString(16).padStart(2, '0'))
 				    .join(' ');
-				Log.v(this.TAG, `First bytes: ${hexBytes}`);
+				// Log.v(this.TAG, `First bytes: ${hexBytes}`);
 			    }
 			}
 
 			// Handle fragment from previous chunk
 			if (fragmentBuffer.length > 0) {
-			    Log.v(this.TAG, `Merging fragment buffer (${fragmentBuffer.length} bytes) with new chunk`);
+			    //Log.v(this.TAG, `Merging fragment buffer (${fragmentBuffer.length} bytes) with new chunk`);
 			    let merged = new Uint8Array(fragmentBuffer.length + chunk.length);
 			    merged.set(fragmentBuffer, 0);
 			    merged.set(chunk, fragmentBuffer.length);
@@ -968,7 +974,7 @@ class WebTransportLoader extends BaseLoader {
 			    }
 			    
 			    if (syncIndex > 0) {
-				Log.v(this.TAG, `Found sync byte at offset ${syncIndex}, trimming chunk`);
+				//Log.v(this.TAG, `Found sync byte at offset ${syncIndex}, trimming chunk`);
 				chunk = chunk.slice(syncIndex);
 			    } else if (syncIndex === -1) {
 				Log.v(this.TAG, `No sync byte found in first 1000 bytes, skipping chunk`);
@@ -978,14 +984,14 @@ class WebTransportLoader extends BaseLoader {
 
 			const packets = this.tsBuffer.addChunk(chunk);
 			if (packets) {
-			    Log.v(this.TAG, `Processing ${packets.length} valid packets from chunk`);
+			    //Log.v(this.TAG, `Processing ${packets.length} valid packets from chunk`);
 			    this._processPackets(packets);
 			} else {
 			    Log.v(this.TAG, `No valid packets found in chunk of ${chunk.byteLength} bytes`);
 			}
 
 			if (this._packetBuffer.length > 0) {
-                           Log.v(this.TAG, `Flushing ${this._packetBuffer.length} remaining packets`);
+                           //Log.v(this.TAG, `Flushing ${this._packetBuffer.length} remaining packets`);
                            this._dispatchPacketChunk();
                         }
 		    }
@@ -998,7 +1004,7 @@ class WebTransportLoader extends BaseLoader {
 		    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
 		}
 	    } finally {
-		Log.v(this.TAG, `_readChunks ended after processing ${this._receivedLength} bytes`);
+		//Log.v(this.TAG, `_readChunks ended after processing ${this._receivedLength} bytes`);
 	    }
 	}
 }
