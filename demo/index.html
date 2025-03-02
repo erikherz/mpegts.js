@@ -56,12 +56,25 @@
             background: #0056b3;
         }
         .logcatBox {
+            display: none;
             width: 100%;
             padding: 10px;
             border: 1px solid #ddd;
             border-radius: 4px;
             font-family: monospace;
             background: #f8f9fa;
+        }
+        .toggleLog {
+            display: block;
+            text-align: right;
+            margin-top: 5px;
+            cursor: pointer;
+            color: blue;
+            text-decoration: underline;
+        }
+
+        .toggleLog:hover {
+           color: darkblue;
         }
     </style>
 </head>
@@ -79,11 +92,12 @@
             </video>
         </div>
         <div class="controls">
-            <button onclick="player_load()">Load</button>
-            <button onclick="player_start()">Start</button>
+            <button onclick="player_load()">Connect</button>
+            <button onclick="player_start()">Play</button>
             <button onclick="player_pause()">Pause</button>
-            <button onclick="player_destroy()">Destroy</button>
+            <button onclick="player_destroy()">Disconnect</button>
         </div>
+	<a href="#" class="toggleLog" onclick="toggleLog(); return false;">Show Log</a>
         <textarea id="logcatbox" class="logcatBox" rows="10" readonly></textarea>
     </div>
 
@@ -147,6 +161,19 @@
                 player_load();
             }
         });
+
+        function toggleLog() {
+            var logBox = document.getElementById("logcatbox");
+            var toggleLink = document.querySelector(".toggleLog");
+
+            if (logBox.style.display === "none" || logBox.style.display === "") {
+                logBox.style.display = "block";
+                toggleLink.textContent = "Hide Log";
+            } else {
+                logBox.style.display = "none";
+                toggleLink.textContent = "Show Log";
+            }
+        }
     </script>
 </body>
 </html>

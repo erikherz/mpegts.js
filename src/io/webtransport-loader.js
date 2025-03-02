@@ -1745,22 +1745,44 @@ class WebTransportLoader extends BaseLoader {
 	    };
     }
 
-    abort() {
-	if (this.diagnosticTimer) {
-           clearInterval(this.diagnosticTimer);
-           this.diagnosticTimer = null;
-        }   
-        if (this._transport && !this._transport.closed) {
-            this._requestAbort = true;
-            if (this._reader) {
-                this._reader.cancel();
-            }
-            this._transport.close();
-        }
-        this._transport = null;
-        this._reader = null;
-        this._status = LoaderStatus.kComplete;
-    }
+	async abort() {
+	    // First, clear any timers or intervals
+	    if (this.diagnosticTimer) {
+		clearInterval(this.diagnosticTimer);
+		this.diagnosticTimer = null;
+	    }
+	    
+	    // Signal abort request
+	    this._requestAbort = true;
+	    
+	    try {
+		// Cancel the reader first
+		if (this._reader) {
+		    await this._reader.cancel("Loader aborted").catch(e => {
+			Log.w(this.TAG, `Error canceling reader: ${e.message}`);
+		    });
+		    this._reader = null;
+		}
+		
+		// Close the transport with a clean reason
+		if (this._transport && !this._transport.closed) {
+		    Log.v(this.TAG, "Closing WebTransport connection...");
+		    await this._transport.close({closeCode: 0, reason: "Player destroyed"}).catch(e => {
+			Log.w(this.TAG, `Error closing transport: ${e.message}`);
+		    });
+		}
+	    } catch (e) {
+		Log.e(this.TAG, `Error during abort: ${e.message}`);
+	    } finally {
+		// Ensure nullification even if errors occur
+		this._transport = null;
+		this._packetBuffer = [];
+		this.tsBuffer = null;
+		this._status = LoaderStatus.kComplete;
+		
+		Log.v(this.TAG, "WebTransport connection cleanup complete");
+	    }
+	}
 
 	_processPackets(packets) {
 	    if (!packets || !Array.isArray(packets)) return;
@@ -1887,74 +1909,91 @@ class WebTransportLoader extends BaseLoader {
 		let debugCounter = 0;
 
 		while (true) {
-		    if (this._requestAbort) break;
-		    
-		    const { value, done } = await this._reader.read();
-		    if (done) {
-			//Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
-			// Process any remaining valid data
-			if (pendingData.length >= 188) {
-			    const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
-			    const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
-			    if (packets) {
-				this._processPackets(packets);
-			    }
-			}
+		    if (this._requestAbort) {
+			Log.v(this.TAG, "Read loop terminated due to abort request");
 			break;
 		    }
+		    
+		    try {
+			const { value, done } = await this._reader.read();
+			
+			// Check abort flag again after the async read operation
+			if (this._requestAbort) break;
+			
+			if (done) {
+			    //Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
+			    // Process any remaining valid data
+			    if (pendingData.length >= 188) {
+				const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
+				const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
+				if (packets) {
+				    this._processPackets(packets);
+				}
+			    }
+			    break;
+			}
 
-		    if (value) {
-			let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-			debugCounter++;
-			
-			// Combine with any pending data from previous chunks
-			if (pendingData.length > 0) {
-			    const newBuffer = new Uint8Array(pendingData.length + chunk.length);
-			    newBuffer.set(pendingData, 0);
-			    newBuffer.set(chunk, pendingData.length);
-			    chunk = newBuffer;
-			    pendingData = new Uint8Array(0);
-			}
-			
-			// Find and align to the first valid sync byte pattern
-			const syncIndex = this._findAlignedSyncByte(chunk);
-			
-			if (syncIndex === -1) {
-			    // No valid pattern found, store the chunk for next iteration
-			    pendingData = chunk;
-			    Log.w(this.TAG, `No valid sync pattern found in chunk (${chunk.length} bytes)`);
-			    continue;
-			} else if (syncIndex > 0) {
-			    // Skip data before the first valid sync byte
-			    chunk = chunk.slice(syncIndex);
-			    Log.d(this.TAG, `Aligned to sync byte at offset ${syncIndex}`);
-			}
-			
-			// Process only complete 188-byte packets
-			const validLength = Math.floor(chunk.length / 188) * 188;
-			
-			if (validLength > 0) {
-			    const validChunk = chunk.slice(0, validLength);
-			    const packets = this.tsBuffer.addChunk(validChunk);
+			if (value) {
+			    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+			    debugCounter++;
 			    
-			    if (packets) {
-				//Log.v(this.TAG, `Processing ${packets.length} valid packets from ${validLength} bytes`);
-				this._processPackets(packets);
-			    } else {
-				Log.w(this.TAG, `Failed to extract valid packets from ${validLength} bytes`);
+			    // Combine with any pending data from previous chunks
+			    if (pendingData.length > 0) {
+				const newBuffer = new Uint8Array(pendingData.length + chunk.length);
+				newBuffer.set(pendingData, 0);
+				newBuffer.set(chunk, pendingData.length);
+				chunk = newBuffer;
+				pendingData = new Uint8Array(0);
+			    }
+			    
+			    // Find and align to the first valid sync byte pattern
+			    const syncIndex = this._findAlignedSyncByte(chunk);
+			    
+			    if (syncIndex === -1) {
+				// No valid pattern found, store the chunk for next iteration
+				pendingData = chunk;
+				Log.w(this.TAG, `No valid sync pattern found in chunk (${chunk.length} bytes)`);
+				continue;
+			    } else if (syncIndex > 0) {
+				// Skip data before the first valid sync byte
+				chunk = chunk.slice(syncIndex);
+				Log.d(this.TAG, `Aligned to sync byte at offset ${syncIndex}`);
+			    }
+			    
+			    // Process only complete 188-byte packets
+			    const validLength = Math.floor(chunk.length / 188) * 188;
+			    
+			    if (validLength > 0) {
+				const validChunk = chunk.slice(0, validLength);
+				const packets = this.tsBuffer.addChunk(validChunk);
+				
+				if (packets) {
+				    //Log.v(this.TAG, `Processing ${packets.length} valid packets from ${validLength} bytes`);
+				    this._processPackets(packets);
+				} else {
+				    Log.w(this.TAG, `Failed to extract valid packets from ${validLength} bytes`);
+				}
+			    }
+			    
+			    // Store any remaining partial packet for the next chunk
+			    if (validLength < chunk.length) {
+				pendingData = chunk.slice(validLength);
+				//Log.d(this.TAG, `Storing ${pendingData.length} bytes for next chunk`);
 			    }
 			}
-			
-			// Store any remaining partial packet for the next chunk
-			if (validLength < chunk.length) {
-			    pendingData = chunk.slice(validLength);
-			    //Log.d(this.TAG, `Storing ${pendingData.length} bytes for next chunk`);
+		    } catch (readError) {
+			// If the error is due to abort, handle gracefully
+			if (this._requestAbort) {
+			    Log.v(this.TAG, "Read operation aborted as requested");
+			    break;
 			}
+			// Otherwise re-throw for the outer catch to handle
+			throw readError;
 		    }
 		}
 		
-		// Flush any remaining packets
-		if (this._packetBuffer.length > 0) {
+		// Flush any remaining packets if we're not aborting
+		if (this._packetBuffer.length > 0 && !this._requestAbort) {
 		    this._dispatchPacketChunk();
 		}
 		
@@ -1967,6 +2006,7 @@ class WebTransportLoader extends BaseLoader {
 		}
 	    }
 	}
+
 }
 
 export default WebTransportLoader;
