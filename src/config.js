@@ -17,29 +17,29 @@
  */
 
 export const defaultConfig = {
-    enableWorker: false,
-    enableWorkerForMSE: false,
+    enableWorker: true,
+    enableWorkerForMSE: true,
     enableStashBuffer: true,
-    stashInitialSize: undefined,
+    stashInitialSize: 512000,
 
-    isLive: false,
+    isLive: true,
 
-    liveBufferLatencyChasing: false,
+    liveBufferLatencyChasing: true,
     liveBufferLatencyChasingOnPaused: false,
-    liveBufferLatencyMaxLatency: 1.5,
-    liveBufferLatencyMinRemain: 0.5,
+    liveBufferLatencyMaxLatency: 3,
+    liveBufferLatencyMinRemain: 1.0,
 
-    liveSync: false,
-    liveSyncMaxLatency: 1.2,
-    liveSyncTargetLatency: 0.8,
-    liveSyncPlaybackRate: 1.2,
+    liveSync: true,
+    liveSyncMaxLatency: 3.5,
+    liveSyncTargetLatency: 1.8,
+    liveSyncPlaybackRate: 1.1,
 
     lazyLoad: true,
     lazyLoadMaxDuration: 3 * 60,
     lazyLoadRecoverDuration: 30,
     deferLoadAfterSourceOpen: true,
 
-    // autoCleanupSourceBuffer: default as false, leave unspecified
+    autoCleanupSourceBuffer: true,
     autoCleanupMaxBackwardDuration: 3 * 60,
     autoCleanupMinBackwardDuration: 2 * 60,
 
