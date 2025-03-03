@@ -829,6 +829,238 @@ class PacketLogger {
     }
 }
 
+/**
+ * MPEGTSTestHarness - Class for monitoring and testing MPEG-TS stream health
+ */
+class MPEGTSTestHarness {
+    constructor(options = {}) {
+        this.TAG = 'MPEGTSTestHarness';
+        this.onLog = options.onLog || (() => {});
+
+        // Metrics tracking
+        this.metrics = {
+            packetsReceived: 0,
+            syncLossCount: 0,
+            ccErrorCount: 0,
+            ptsJumpCount: 0,
+            streamSwitches: 0,
+            lastPTSValue: null,
+            ptsTimestamps: [],
+            packetGaps: []
+        };
+
+        // Reference to the loader
+        this.loader = null;
+
+        // Sampling rate
+        this.sampleRate = options.sampleRate || 20; // 1 in X packets
+        this.maxSampleHistory = options.maxSampleHistory || 100;
+    }
+
+    reset() {
+        this.metrics = {
+            packetsReceived: 0,
+            syncLossCount: 0,
+            ccErrorCount: 0,
+            ptsJumpCount: 0,
+            streamSwitches: 0,
+            lastPTSValue: null,
+            ptsTimestamps: [],
+            packetGaps: []
+        };
+
+        this.onLog('Test harness reset complete');
+    }
+
+    integrateWithLoader(loader) {
+        this.loader = loader;
+        this.onLog('Test harness integrated with loader');
+    }
+
+    recordPacketReceived(packet, timestamp) {
+        this.metrics.packetsReceived++;
+
+        // Sample only a portion of packets for performance
+        if (this.metrics.packetsReceived % this.sampleRate !== 0) {
+            return;
+        }
+
+        // Check for sync byte
+        if (packet[0] !== 0x47) {
+            this.metrics.syncLossCount++;
+        }
+
+        // Extract PID and continuity counter
+        const pid = ((packet[1] & 0x1F) << 8) | packet[2];
+        const cc = packet[3] & 0x0F;
+
+        // Record timestamp if it's a video packet with PTS
+        this._extractAndRecordPTS(packet, timestamp);
+    }
+
+    _extractAndRecordPTS(packet, timestamp) {
+        // Extract PTS (simplified implementation)
+        try {
+            const payloadStart = (packet[1] & 0x40) !== 0;
+            const hasAdaptationField = (packet[3] & 0x20) !== 0;
+            const hasPayload = (packet[3] & 0x10) !== 0;
+
+            if (!payloadStart || !hasPayload) {
+                return;
+            }
+
+            // Calculate payload offset
+            const payloadOffset = hasAdaptationField ?
+                (5 + packet[4]) : 4;
+
+            // Ensure we have enough bytes for a PES header
+            if (packet.length < payloadOffset + 14) {
+                return;
+            }
+
+            // Check for PES start code (0x000001)
+            if (packet[payloadOffset] !== 0x00 ||
+                packet[payloadOffset + 1] !== 0x00 ||
+                packet[payloadOffset + 2] !== 0x01) {
+                return;
+            }
+
+            // Check stream ID for video
+            const streamId = packet[payloadOffset + 3];
+            if (streamId < 0xE0 || streamId > 0xEF) {
+                return; // Not video
+            }
+
+            // Check PTS_DTS_flags
+            const ptsDtsFlags = (packet[payloadOffset + 7] & 0xC0) >> 6;
+            if (ptsDtsFlags === 0) {
+                return; // No PTS present
+            }
+
+            // Extract PTS (33-bit value spread across 5 bytes)
+            const p0 = packet[payloadOffset + 9];
+            const p1 = packet[payloadOffset + 10];
+            const p2 = packet[payloadOffset + 11];
+            const p3 = packet[payloadOffset + 12];
+            const p4 = packet[payloadOffset + 13];
+
+            // Combine the bytes according to MPEG-TS spec
+            const pts = (((p0 >> 1) & 0x07) << 30) |
+                       (p1 << 22) |
+                       (((p2 >> 1) & 0x7F) << 15) |
+                       (p3 << 7) |
+                       ((p4 >> 1) & 0x7F);
+
+            // Check for PTS jumps
+            if (this.metrics.lastPTSValue !== null) {
+                const ptsDiff = Math.abs(pts - this.metrics.lastPTSValue);
+                // Check for unexpected jumps (over 45000 in 90kHz clock is ~0.5 sec)
+                if (ptsDiff > 45000 && ptsDiff < 8589934592) { // Ignore wraparound
+                    this.metrics.ptsJumpCount++;
+                }
+            }
+
+            this.metrics.lastPTSValue = pts;
+
+            // Record PTS with timestamp
+            this.metrics.ptsTimestamps.push({
+                pts: pts,
+                timestamp: timestamp
+            });
+
+            // Keep history within bounds
+            if (this.metrics.ptsTimestamps.length > this.maxSampleHistory) {
+                this.metrics.ptsTimestamps.shift();
+            }
+
+        } catch (e) {
+            // Silently ignore extraction errors
+        }
+    }
+
+    recordStreamSwitch() {
+        this.metrics.streamSwitches++;
+    }
+
+    generateReport() {
+        // Calculate stream health indicators
+        let ptsJitterMs = 0;
+        let bitrateBps = 0;
+        let streamSwitchRate = 0;
+
+        // Calculate PTS jitter if we have enough samples
+        if (this.metrics.ptsTimestamps.length > 5) {
+            try {
+                // Measure PTS vs wall clock consistency
+                const ptsRatios = [];
+                for (let i = 1; i < this.metrics.ptsTimestamps.length; i++) {
+                    const curr = this.metrics.ptsTimestamps[i];
+                    const prev = this.metrics.ptsTimestamps[i-1];
+
+                    const ptsDiff = (curr.pts - prev.pts) & 0x1FFFFFFFF; // Handle 33-bit wraparound
+                    const timeDiff = curr.timestamp - prev.timestamp;
+
+                    if (timeDiff > 0) {
+                        // PTS is in 90kHz clock, convert to ms
+                        const expectedTime = ptsDiff / 90; // ms
+                        const ratio = expectedTime / timeDiff;
+                        ptsRatios.push(ratio);
+                    }
+                }
+
+                // Calculate average and standard deviation
+                if (ptsRatios.length > 0) {
+                    const avgRatio = ptsRatios.reduce((a, b) => a + b, 0) / ptsRatios.length;
+                    const variance = ptsRatios.reduce((a, b) => a + Math.pow(b - avgRatio, 2), 0) / ptsRatios.length;
+                    ptsJitterMs = Math.sqrt(variance) * 100; // Convert to ms scale
+                }
+            } catch (e) {
+                this.onLog(`Error calculating jitter: ${e.message}`);
+            }
+        }
+
+        // Get additional metrics from loader if available
+        let rotationStats = {};
+        let streamCount = 0;
+
+        if (this.loader) {
+            if (typeof this.loader.getStreamHealthReport === 'function') {
+                try {
+                    const healthReport = this.loader.getStreamHealthReport();
+                    rotationStats = healthReport.rotationStats || {};
+                    streamCount = healthReport.streamCount || 0;
+
+                    // Calculate bitrate from bytes received if possible
+                    if (healthReport.receivedBytes &&
+                        this.metrics.ptsTimestamps.length >= 2) {
+                        const firstTs = this.metrics.ptsTimestamps[0].timestamp;
+                        const lastTs = this.metrics.ptsTimestamps[this.metrics.ptsTimestamps.length - 1].timestamp;
+                        const durationSec = (lastTs - firstTs) / 1000;
+
+                        if (durationSec > 0) {
+                            bitrateBps = Math.round((healthReport.receivedBytes * 8) / durationSec);
+                        }
+                    }
+                } catch (e) {
+                    this.onLog(`Error getting loader health report: ${e.message}`);
+                }
+            }
+        }
+
+        return {
+            packetsReceived: this.metrics.packetsReceived,
+            syncLossRate: this.metrics.packetsReceived > 0 ?
+                (this.metrics.syncLossCount / this.metrics.packetsReceived) : 0,
+            ptsJumpCount: this.metrics.ptsJumpCount,
+            streamSwitches: this.metrics.streamSwitches,
+            estimatedBitrate: bitrateBps,
+            ptsJitterMs: ptsJitterMs,
+            activeStreamCount: streamCount,
+            ...rotationStats
+        };
+    }
+}
+
 class WebTransportLoader extends BaseLoader {
     constructor() {
         super('webtransport-loader');
@@ -866,11 +1098,12 @@ class WebTransportLoader extends BaseLoader {
             flushThreshold: this.config.packetFlushThreshold
         });
 
-        // Initialize testHarness properly
+        // Initialize testHarness properly - now using our new class
         this.testHarness = new MPEGTSTestHarness({
             onLog: (msg) => { Log.v(this.TAG, msg); }
         });
-// Stream tracking
+
+        // Stream tracking
         this._activeStreams = new Map();  // streamId -> {reader, startTime, status}
         this._streamIdCounter = 0;
         this._lastFlushTime = 0;
@@ -921,161 +1154,236 @@ class WebTransportLoader extends BaseLoader {
         super.destroy();
     }
 
-    async open(dataSource) {
-        this.testHarness.reset();
-        this.testHarness.integrateWithLoader(this);
-        
-        try {
-            if (!dataSource.url.startsWith('https://')) {
-                throw new Error('WebTransport requires HTTPS URL');
-            }
-
-            Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
-
-            this._transport = new WebTransport(dataSource.url);
-            await this._transport.ready;
-
-            Log.v(this.TAG, "WebTransport connection established successfully");
-            this._connectionEstablished = true;
-
-            const incomingStreams = this._transport.incomingUnidirectionalStreams;
-            if (!incomingStreams) {
-                throw new Error('Could not get incoming unidirectional streams');
-            }
-            
-            const streamReader = incomingStreams.getReader();
-            const { value: stream, done } = await streamReader.read();
-            
-            if (done || !stream) {
-                throw new Error('No incoming stream received');
-            }
-            
-            // Register the first stream with the rotation handler
-            const firstStreamId = `stream-${++this._streamIdCounter}`;
-            if (this.streamRotationHandler && this.config.enableStreamRotationHandler) {
-                this.streamRotationHandler.registerStream(firstStreamId);
-            }
-            
-            // Track active stream
-            this._activeStreams.set(firstStreamId, {
-                reader: stream.getReader(),
-                startTime: Date.now(),
-                status: 'active',
-                bytesReceived: 0,
-                packetsProcessed: 0
-            });
-            
-            // Set up our reader with the first stream
-            this._reader = this._activeStreams.get(firstStreamId).reader;
-            this._status = LoaderStatus.kBuffering;
-
-            // Start reading data from the first stream
-            this._readChunks();
-            
-            // Start monitoring for additional streams if rotation is enabled
-            if (this.config.enableStreamRotationHandler) {
-                setTimeout(() => {
-                    this._monitorIncomingStreams(streamReader).catch(e => {
-                        Log.e(this.TAG, `Error in stream monitoring: ${e.message}`);
-                    });
-                }, 0);
-            }
-
-            this.diagnosticTimer = setInterval(() => {
-               this.advancedStreamDiagnosis();
-            }, 10000); // Run diagnosis every 10 seconds
-
-        } catch (e) {
-            Log.e(this.TAG, `Error opening WebTransport connection: ${e.message}`);
-            this._status = LoaderStatus.kError;
-            if (this._onError) {
-                this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
-            }
+async open(dataSource) {
+    this.testHarness.reset();
+    this.testHarness.integrateWithLoader(this);
+    
+    try {
+        if (!dataSource.url.startsWith('https://')) {
+            throw new Error('WebTransport requires HTTPS URL');
         }
-    }
 
-    async _monitorIncomingStreams(streamReader) {
-        // Double-check that transport is still valid before starting to monitor
-        if (!this._transport) {
-            Log.e(this.TAG, "Cannot monitor streams: transport is null");
-            return;
-        }
+        Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
+
+        // Create the WebTransport with options that might help keep it alive
+        const options = {
+            allowPooling: true,
+            requireUnreliable: false,
+            congestionControl: 'low-latency'
+        };
         
+        this._transport = new WebTransport(dataSource.url, options);
+        
+        // Listen for connection closure to capture the reason
+        this._transport.closed.then(
+            (info) => {
+                Log.v(this.TAG, `WebTransport connection closed with info: ${JSON.stringify(info)}`);
+                this._onConnectionClosed(info);
+            },
+            (error) => {
+                Log.e(this.TAG, `WebTransport connection closed with error: ${error.message}`);
+                this._onConnectionError(error);
+            }
+        );
+        
+        // Wait for connection to be ready
+        await this._transport.ready;
+        Log.v(this.TAG, "WebTransport connection established successfully");
+        
+        // Check if connection is still valid immediately after establishing
         if (this._transport.closed) {
-            Log.e(this.TAG, "Cannot monitor streams: transport is closed");
-            return;
+            throw new Error("Transport closed immediately after connection");
         }
         
-        try {
-            Log.v(this.TAG, "Monitoring for additional incoming streams");
-            
-            while (!this._requestAbort) {
-                try {
-                    // Check if transport is still valid before each read
-                    if (!this._transport) {
-                        Log.e(this.TAG, "Transport is null during stream monitoring");
-                        break;
-                    }
-                    
-                    if (this._transport.closed) {
-                        Log.e(this.TAG, "Transport closed during stream monitoring");
-                        break;
-                    }
-                    
-                    const { value: stream, done } = await streamReader.read();
-                    
-                    if (done) {
-                        Log.v(this.TAG, "No more incoming streams available");
-                        break;
-                    }
-                    
-                    if (!stream) {
-                        Log.w(this.TAG, "Received null stream, continuing");
-                        continue;
-                    }
-                    
-                    const streamId = `stream-${++this._streamIdCounter}`;
-                    Log.v(this.TAG, `New stream detected: ${streamId}`);
-                    
-                    // Register the stream with the rotation handler
-                    if (this.streamRotationHandler) {
-                        this.streamRotationHandler.registerStream(streamId);
-                    }
-                    
-                    // Record the time of the stream switch for diagnostics
-                    this._lastStreamSwitchTime = Date.now();
-                    
-                    // Store the stream and its reader
-                    const streamReader = stream.getReader();
-                    this._activeStreams.set(streamId, {
-                        reader: streamReader,
-                        startTime: Date.now(),
-                        status: 'active',
-                        bytesReceived: 0,
-                        packetsProcessed: 0
-                    });
-                    
-                    // Process the new stream in parallel
-                    this._processStreamData(streamId, streamReader);
-                }
-                catch (streamError) {
-                    if (this._requestAbort) break;
-                    
-                    Log.e(this.TAG, `Error reading stream: ${streamError.message}`);
-                    // Continue trying to read more streams despite errors
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                }
-            }
-        } catch (e) {
-            if (!this._requestAbort) {
-                Log.e(this.TAG, `Error monitoring streams: ${e.message}`);
-                if (this._onError) {
-                    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
-                }
-            }
+        // Add a heartbeat to keep the connection alive
+        this._startHeartbeat();
+
+        // Set up incoming streams
+        const incomingStreams = this._transport.incomingUnidirectionalStreams;
+        if (!incomingStreams) {
+            throw new Error('Could not get incoming unidirectional streams');
+        }
+        
+        const streamReader = incomingStreams.getReader();
+        const { value: stream, done } = await streamReader.read();
+        
+        if (done || !stream) {
+            throw new Error('No incoming stream received');
+        }
+        
+        // Register the stream with rotation handler (if implemented)
+        const firstStreamId = `stream-${Date.now()}`;
+        if (this.streamRotationHandler) {
+            this.streamRotationHandler.registerStream(firstStreamId);
+        }
+        
+        // Store the stream
+        this._reader = stream.getReader();
+        this._status = LoaderStatus.kBuffering;
+        
+        // Start reading data
+        this._readChunks();
+        
+        // Set up stream monitoring
+        this._monitorStreams(streamReader);
+
+    } catch (e) {
+        Log.e(this.TAG, `Error opening WebTransport connection: ${e.message}`);
+        this._status = LoaderStatus.kError;
+        if (this._onError) {
+            this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
         }
     }
+}
 
+_startHeartbeat() {
+    // Send a heartbeat every 5 seconds to keep the connection alive
+    this._heartbeatInterval = setInterval(async () => {
+        try {
+            if (this._transport && !this._transport.closed) {
+                // Create a bidirectional stream as a heartbeat
+                const stream = await this._transport.createBidirectionalStream();
+                const writer = stream.writable.getWriter();
+
+                // Send a simple ping message
+                const encoder = new TextEncoder();
+                const pingData = encoder.encode('ping');
+                await writer.write(pingData);
+
+                // Close the stream properly
+                await writer.close();
+
+                Log.v(this.TAG, "Heartbeat sent to keep connection alive");
+            } else {
+                Log.e(this.TAG, "Cannot send heartbeat: transport closed");
+                clearInterval(this._heartbeatInterval);
+            }
+        } catch (e) {
+            Log.w(this.TAG, `Heartbeat error: ${e.message}`);
+        }
+    }, 5000);
+}
+
+_onConnectionClosed(info) {
+    // Handle normal closure
+    if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError) {
+        this._status = LoaderStatus.kError;
+        if (this._onError) {
+            this._onError(LoaderErrors.CONNECTION_ERROR, {
+                code: -1,
+                msg: `WebTransport connection closed: ${JSON.stringify(info)}`
+            });
+        }
+    }
+}
+
+_onConnectionError(error) {
+    // Handle error closure
+    if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError) {
+        this._status = LoaderStatus.kError;
+        if (this._onError) {
+            this._onError(LoaderErrors.CONNECTION_ERROR, {
+                code: error.code || -1,
+                msg: `WebTransport connection error: ${error.message}`
+            });
+        }
+    }
+}
+
+async _monitorStreams(streamReader) {
+    try {
+        Log.v(this.TAG, "Monitoring for additional incoming streams");
+
+        while (!this._requestAbort) {
+            try {
+                // Validate transport before each read
+                if (!this._transport || this._transport.closed) {
+                    Log.e(this.TAG, "Transport is closed or null during stream monitoring");
+                    break;
+                }
+
+                const { value: stream, done } = await streamReader.read();
+
+                if (done) {
+                    Log.v(this.TAG, "No more incoming streams available");
+                    break;
+                }
+
+                if (!stream) {
+                    Log.w(this.TAG, "Received null stream, continuing");
+                    continue;
+                }
+
+                Log.v(this.TAG, "New stream received, processing...");
+
+                // Process the new stream (implementation depends on your rotation handler)
+                // For now, we'll just use the most recent stream
+                this._reader = stream.getReader();
+
+                // If you implement rotation, you would do something like:
+                // this.streamRotationHandler.addStream(stream.getReader());
+            } catch (streamError) {
+                if (this._requestAbort) break;
+
+                Log.e(this.TAG, `Error reading stream: ${streamError.message}`);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+    } catch (e) {
+        Log.e(this.TAG, `Stream monitor error: ${e.message}`);
+    }
+}
+
+_checkConnectionState() {
+    // Check if transport is invalid or closed but we think it's active
+    if ((this._transport === null || this._transport.closed) && 
+        this._status !== LoaderStatus.kError && 
+        this._status !== LoaderStatus.kComplete) {
+        
+        Log.e(this.TAG, "WebTransport connection has closed unexpectedly");
+        
+        // Set proper status
+        this._status = LoaderStatus.kError;
+        
+        // Notify error handler
+        if (this._onError) {
+            this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                code: -1, 
+                msg: "WebTransport connection closed unexpectedly" 
+            });
+        }
+        
+        // Clean up resources
+        this._cleanup();
+        
+        return false;
+    }
+    return true;
+}
+
+_cleanup() {
+    // Nullify references to avoid using closed connections
+    this._reader = null;
+    
+    // Mark all streams as ended
+    for (const [streamId, streamData] of this._activeStreams.entries()) {
+        streamData.status = 'ended';
+        if (this.streamRotationHandler) {
+            this.streamRotationHandler.endStream(streamId);
+        }
+    }
+    
+    // Flush any pending data
+    if (this._packetBuffer.length > 0) {
+        this._dispatchPacketChunk();
+    }
+    
+    if (this._outputBuffer.length > 0) {
+        this._flushOutputBuffer();
+    }
+    
+    Log.v(this.TAG, "Connection resources cleaned up");
+}
 
 async _processStreamData(streamId, reader) {
     if (!reader) {
@@ -1383,6 +1691,8 @@ _findAlignedSyncByte(buffer) {
 async _readChunks() {
     try {
         let pendingData = new Uint8Array(0);
+        let lastReadSuccess = Date.now();
+        const READ_TIMEOUT = 15000; // 15 seconds timeout for reads
 
         while (true) {
             if (this._requestAbort) {
@@ -1390,13 +1700,87 @@ async _readChunks() {
                 break;
             }
             
+            // Check if transport is closed but we haven't detected it
+            if (!this._transport || this._transport.closed) {
+                Log.e(this.TAG, "Transport is closed or null in read loop");
+                
+                // Set proper error state
+                this._status = LoaderStatus.kError;
+                
+                // Notify error handler
+                if (this._onError) {
+                    this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                        code: -1, 
+                        msg: "WebTransport connection closed unexpectedly" 
+                    });
+                }
+                
+                break;
+            }
+            
+            // Check for read timeout
+            if (Date.now() - lastReadSuccess > READ_TIMEOUT) {
+                Log.e(this.TAG, `Read timeout after ${READ_TIMEOUT}ms without data`);
+                
+                // Set proper error state
+                this._status = LoaderStatus.kError;
+                
+                if (this._onError) {
+                    this._onError(LoaderErrors.TIMEOUT, { 
+                        code: -1, 
+                        msg: "Read timeout - no data received" 
+                    });
+                }
+                
+                break;
+            }
+            
             try {
+                // Check if reader is valid before read
+                if (!this._reader) {
+                    Log.e(this.TAG, "Reader is null in read loop");
+                    
+                    // Set proper error state
+                    this._status = LoaderStatus.kError;
+                    
+                    if (this._onError) {
+                        this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                            code: -1, 
+                            msg: "Reader is invalid" 
+                        });
+                    }
+                    
+                    break;
+                }
+                
                 const { value, done } = await this._reader.read();
+                
+                // Update last successful read time
+                lastReadSuccess = Date.now();
                 
                 // Check abort flag again after the async read operation
                 if (this._requestAbort) break;
                 
+                // Check transport again after async operation
+                if (!this._transport || this._transport.closed) {
+                    Log.e(this.TAG, "Transport closed during read operation");
+                    
+                    // Set proper error state
+                    this._status = LoaderStatus.kError;
+                    
+                    if (this._onError) {
+                        this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                            code: -1, 
+                            msg: "WebTransport connection closed during read" 
+                        });
+                    }
+                    
+                    break;
+                }
+                
                 if (done) {
+                    Log.v(this.TAG, "Read stream ended");
+                    
                     // Process any remaining valid data
                     if (pendingData.length >= 188) {
                         const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
@@ -1454,8 +1838,28 @@ async _readChunks() {
                 if (this._requestAbort) {
                     break;
                 }
-                // Otherwise re-throw for the outer catch to handle
-                throw readError;
+                
+                // Check if error is due to closed connection
+                if (this._transport && this._transport.closed) {
+                    Log.e(this.TAG, "Transport closed during read operation");
+                    
+                    // Set proper error state
+                    this._status = LoaderStatus.kError;
+                    
+                    if (this._onError) {
+                        this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                            code: -1, 
+                            msg: "WebTransport connection closed during read" 
+                        });
+                    }
+                    
+                    break;
+                }
+                
+                Log.e(this.TAG, `Error in read operation: ${readError.message}`);
+                
+                // Brief pause before retry to avoid tight loop
+                await new Promise(resolve => setTimeout(resolve, 100));
             }
         }
         
@@ -1555,6 +1959,12 @@ async abort() {
     if (this.diagnosticTimer) {
         clearInterval(this.diagnosticTimer);
         this.diagnosticTimer = null;
+    }
+
+    // Clear heartbeat
+    if (this._heartbeatInterval) {
+        clearInterval(this._heartbeatInterval);
+        this._heartbeatInterval = null;
     }
     
     // Signal abort request
