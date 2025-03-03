@@ -38,6 +38,11 @@ class MPEGTSTestHarness {
 
         // Track continuity counters for each PID
         this.continuityCounters = new Map();
+
+        // Global state
+        this._isInitialized = false;  // Whether MSE has been initialized
+        this._lastPTS = null;         // Last PTS value to track continuity
+        this._activeStreamId = null;  // Currently active stream ID
     }
 
     reset() {
@@ -1331,6 +1336,12 @@ class WebTransportLoader extends BaseLoader {
 
             this._readChunks();
 
+	    this._transport = new WebTransport(dataSource.url);
+	    await this._transport.ready;
+		
+	    // Start a continuous process to monitor for new streams
+	    this._monitorIncomingStreams();
+
             this.diagnosticTimer = setInterval(() => {
                this.advancedStreamDiagnosis();
             }, 10000); // Run diagnosis every 10 seconds
@@ -1342,6 +1353,75 @@ class WebTransportLoader extends BaseLoader {
             }
         }
     }
+
+	async _processStreamData(stream, streamId) {
+	    const reader = stream.getReader();
+	    
+	    // Update active stream ID
+	    const previousStreamId = this._activeStreamId;
+	    this._activeStreamId = streamId;
+	    
+	    // If we're switching streams, prepare for potential discontinuity
+	    if (previousStreamId !== null && previousStreamId !== streamId) {
+		Log.v(this.TAG, `Switching from stream ${previousStreamId} to ${streamId}, preparing for discontinuity`);
+		
+		// Signal discontinuity to your MSE controller
+		// This might involve calling a method like:
+		if (this._onStreamDiscontinuity) {
+		    this._onStreamDiscontinuity();
+		}
+	    }
+	    try {
+		let pendingData = new Uint8Array(0);
+		
+		while (true) {
+		    const { value, done } = await reader.read();
+		    
+		    if (done) {
+			Log.v(this.TAG, `Stream ${streamId} ended`);
+			// Process any remaining data
+			// ...
+			break;
+		    }
+		    
+		    if (value) {
+			// Process chunk as in your existing _readChunks method
+			// ...
+		    }
+		}
+	    } catch (e) {
+		Log.e(this.TAG, `Error reading stream ${streamId}: ${e.message}`);
+	    }
+	}
+
+	async _monitorIncomingStreams() {
+	    const incomingStreams = this._transport.incomingUnidirectionalStreams;
+	    const streamReader = incomingStreams.getReader();
+	    
+	    try {
+		while (true) {
+		    const { value: stream, done } = await streamReader.read();
+		    
+		    if (done) {
+			Log.v(this.TAG, "No more incoming streams available");
+			break;
+		    }
+		    
+		    if (!stream) {
+			Log.w(this.TAG, "Received null stream, continuing");
+			continue;
+		    }
+		    
+		    Log.v(this.TAG, "New stream detected, starting reader");
+		    
+		    // Each stream gets its own reader
+		    const streamId = crypto.randomUUID(); // Generate unique ID
+		    this._processStreamData(stream, streamId);
+		}
+	    } catch (e) {
+		Log.e(this.TAG, `Error monitoring streams: ${e.message}`);
+	    }
+	}
 
 	async advancedStreamDiagnosis() {
 	    // Create a diagnostic report
@@ -1786,7 +1866,7 @@ class WebTransportLoader extends BaseLoader {
 
 	_processPackets(packets) {
 	    if (!packets || !Array.isArray(packets)) return;
-				    
+			    
 	    const now = Date.now();
 	    let validPackets = [];
 	    
@@ -1816,6 +1896,27 @@ class WebTransportLoader extends BaseLoader {
 		}
 	    } else if (validPackets.length > 0) {
 		this.consecutiveErrors = 0;
+	    }
+	    
+	    // Handle PTS continuity across streams
+	    if (this.packetLogger.lastValidPTS !== null) {
+		// Initialize PTS tracking if needed
+		if (this._lastGlobalPTS === undefined) {
+		    this._lastGlobalPTS = this.packetLogger.lastValidPTS;
+		    this._ptsOffset = 0;
+		} 
+		// Check for PTS wrapping backwards (could happen with stream switch)
+		else if (this.packetLogger.lastValidPTS < this._lastGlobalPTS &&
+			Math.abs(this.packetLogger.lastValidPTS - this._lastGlobalPTS) > 4500000) { // >50 sec diff suggests discontinuity
+		    
+		    // Calculate offset to maintain continuity
+		    const newOffset = this._ptsOffset + (this._lastGlobalPTS - this.packetLogger.lastValidPTS) + 90000; // +1 second gap
+		    Log.v(this.TAG, `PTS discontinuity detected: last=${this._lastGlobalPTS}, current=${this.packetLogger.lastValidPTS}, applying offset=${newOffset - this._ptsOffset}`);
+		    this._ptsOffset = newOffset;
+		}
+		
+		// Update global PTS tracking
+		this._lastGlobalPTS = this.packetLogger.lastValidPTS + this._ptsOffset;
 	    }
 	    
 	    // Only add valid packets to the buffer
@@ -1848,6 +1949,11 @@ class WebTransportLoader extends BaseLoader {
 	    // Calculate byte positions
 	    const byteStart = this._receivedLength - totalLength;
 
+	    // Track initialization state to avoid re-initializing on stream switches
+	    if (this._isInitialized === undefined) {
+		this._isInitialized = false;
+	    }
+
 	    // Validate the chunk before sending
 	    const isValid = this.validateTsChunkBeforeSending(chunk.buffer);
 	    
@@ -1856,15 +1962,40 @@ class WebTransportLoader extends BaseLoader {
 		// Try to fix alignment issues
 		const fixedChunk = this._attemptToFixAlignment(chunk.buffer);
 		if (fixedChunk) {
-		    //Log.v(this.TAG, `Sending fixed chunk: ${fixedChunk.byteLength} bytes`);
-		    this._onDataArrival(fixedChunk, byteStart, this._receivedLength);
+		    // Add metadata about initialization state and PTS continuity
+		    const metadata = {
+			isInitialized: this._isInitialized,
+			ptsOffset: this._ptsOffset || 0,
+			isStreamSwitch: this._lastStreamSwitchTime && 
+				       (Date.now() - this._lastStreamSwitchTime < 2000) // 2sec window
+		    };
+		    
+		    this._onDataArrival(fixedChunk, byteStart, this._receivedLength, metadata);
+		    
+		    // After first chunk, mark as initialized for future reference
+		    if (!this._isInitialized) {
+			Log.v(this.TAG, "Media pipeline initialized, future stream switches will reuse this initialization");
+			this._isInitialized = true;
+		    }
 		} else {
 		    Log.e(this.TAG, `Could not fix chunk, skipping`);
 		}
 	    } else {
-		// Dispatch the valid chunk
-		//Log.v(this.TAG, `Sending valid chunk: ${totalLength} bytes (${this._packetBuffer.length} packets)`);
-		this._onDataArrival(chunk.buffer, byteStart, this._receivedLength);
+		// Dispatch the valid chunk with initialization metadata
+		const metadata = {
+		    isInitialized: this._isInitialized,
+		    ptsOffset: this._ptsOffset || 0,
+		    isStreamSwitch: this._lastStreamSwitchTime && 
+				   (Date.now() - this._lastStreamSwitchTime < 2000) // 2sec window
+		};
+		
+		this._onDataArrival(chunk.buffer, byteStart, this._receivedLength, metadata);
+		
+		// After first chunk, mark as initialized for future reference
+		if (!this._isInitialized) {
+		    Log.v(this.TAG, "Media pipeline initialized, future stream switches will reuse this initialization");
+		    this._isInitialized = true;
+		}
 	    }
 
 	    // Clear the buffer
