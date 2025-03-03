@@ -18,299 +18,440 @@ import Log from '../utils/logger.js';
 import {BaseLoader, LoaderStatus, LoaderErrors} from './loader.js';
 import {RuntimeException} from '../utils/exception.js';
 
-class MPEGTSTestHarness {
+/**
+ * Stream Rotation Handler - manages multiple WebTransport streams and provides continuity
+ */
+class StreamRotationHandler {
     constructor(options = {}) {
-        this.onLog = options.onLog || console.log;
-        this.TAG = 'MPEGTSTestHarness';
-        this.packetSize = 188;
-        this.validationResults = {
-            totalChunks: 0,
-            validChunks: 0,
-            totalPackets: 0,
-            validPackets: 0,
-            pidStats: new Map(),
-            pesPackets: 0,
-            validPTS: 0,
-            continuityErrors: 0,
-            alignmentErrors: 0,
-            structureErrors: 0
+        this.TAG = 'StreamRotationHandler';
+        this.onLog = options.onLog || ((msg) => Log.v(this.TAG, msg));
+        
+        // Buffer for data from multiple streams
+        this.streamBuffers = new Map(); // Map of streamId -> buffer array
+        this.activeStreamIds = new Set(); // Currently active stream IDs
+        this.streamPTSRanges = new Map(); // Map of streamId -> {firstPTS, lastPTS}
+        
+        // PTS tracking for continuity
+        this.globalPTSOffset = 0;
+        this.lastGlobalPTS = null;
+        
+        // Ordered packet buffer (across all streams)
+        this.orderedPacketBuffer = [];
+        this.outputSequence = 0; // Used to track output order
+        
+        // Configuration
+        this.config = {
+            maxBufferSize: options.maxBufferSize || 5 * 1024 * 1024, // 5MB per stream
+            minBufferTime: options.minBufferTime || 1000, // Min buffering time in ms
+            maxBufferTime: options.maxBufferTime || 5000, // Max buffering time in ms
+            ptsDiscontinuityThreshold: options.ptsDiscontinuityThreshold || 900000, // 10 seconds in 90kHz clock
+            packetSize: 188,
+            flushThreshold: options.flushThreshold || 100 // Number of packets to trigger a flush
         };
-
-        // Track continuity counters for each PID
-        this.continuityCounters = new Map();
-
-        // Global state
-        this._isInitialized = false;  // Whether MSE has been initialized
-        this._lastPTS = null;         // Last PTS value to track continuity
-        this._activeStreamId = null;  // Currently active stream ID
-    }
-
-    reset() {
-        this.validationResults = {
-            totalChunks: 0,
-            validChunks: 0,
-            totalPackets: 0,
-            validPackets: 0,
-            pidStats: new Map(),
-            pesPackets: 0,
-            validPTS: 0,
-            continuityErrors: 0,
-            alignmentErrors: 0,
-            structureErrors: 0
+        
+        // Stream transition tracking
+        this.lastStreamTransitionTime = 0;
+        this.isInTransition = false;
+        this.transitionSequenceCounter = 0;
+        
+        // Statistics
+        this.stats = {
+            streamsReceived: 0,
+            streamsSwitched: 0,
+            ptsJumps: 0,
+            packetsProcessed: 0,
+            packetsOutputted: 0,
+            discontinuities: 0,
+            streamOverlaps: 0
         };
-        this.continuityCounters = new Map();
     }
-
-    // Process and validate a chunk of data
-    validateChunk(chunk) {
-        if (!chunk || !(chunk instanceof ArrayBuffer || chunk instanceof Uint8Array)) {
-            this.onLog(`${this.TAG}: Invalid chunk type`);
-            return false;
-        }
-
-        const data = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk;
-        this.validationResults.totalChunks++;
-
-        // Check if size is multiple of packet size
-        if (data.length % this.packetSize !== 0) {
-            this.onLog(`${this.TAG}: Chunk size (${data.length}) is not a multiple of ${this.packetSize}`);
-            this.validationResults.alignmentErrors++;
-            return false;
-        }
-
-        // Process each packet in the chunk
-        let allPacketsValid = true;
-        const packets = data.length / this.packetSize;
-
-        for (let i = 0; i < packets; i++) {
-            const packetOffset = i * this.packetSize;
-            const packetValid = this.validatePacket(data, packetOffset);
-
-            if (!packetValid) {
-                allPacketsValid = false;
+    
+    /**
+     * Register a new stream and prepare to receive data
+     * @param {string} streamId - Unique identifier for the stream
+     */
+    registerStream(streamId) {
+        if (!this.streamBuffers.has(streamId)) {
+            this.onLog(`Registering new stream: ${streamId}`);
+            this.streamBuffers.set(streamId, []);
+            this.activeStreamIds.add(streamId);
+            this.streamPTSRanges.set(streamId, { firstPTS: null, lastPTS: null });
+            this.stats.streamsReceived++;
+            
+            // Record transition if we already had an active stream
+            if (this.activeStreamIds.size > 1) {
+                this.lastStreamTransitionTime = Date.now();
+                this.isInTransition = true;
+                this.stats.streamsSwitched++;
+                this.transitionSequenceCounter++;
+                this.onLog(`Stream transition detected, now have ${this.activeStreamIds.size} active streams`);
             }
         }
-
-        if (allPacketsValid) {
-            this.validationResults.validChunks++;
-        }
-
-        return allPacketsValid;
     }
-
-    // Validate a single MPEG-TS packet
-    validatePacket(data, offset) {
-        this.validationResults.totalPackets++;
-
-        // 1. Check sync byte
-        if (data[offset] !== 0x47) {
-            this.onLog(`${this.TAG}: Invalid sync byte at offset ${offset}: 0x${data[offset].toString(16)}`);
-            return false;
+    
+    /**
+     * Process data from a specific stream
+     * @param {string} streamId - Stream identifier 
+     * @param {Uint8Array} data - MPEG-TS data chunk
+     * @param {Object} packetValidator - The TS packet validator to use
+     * @returns {Object|null} - Metadata about processing results
+     */
+    processStreamData(streamId, data, packetValidator) {
+        if (!this.streamBuffers.has(streamId)) {
+            this.registerStream(streamId);
         }
-
-        // 2. Extract basic packet information
-        const transportError = (data[offset + 1] & 0x80) !== 0;
-        const payloadStart = (data[offset + 1] & 0x40) !== 0;
-        const pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2];
-        const scramblingControl = (data[offset + 3] & 0xC0) >> 6;
-        const hasAdaptation = (data[offset + 3] & 0x20) !== 0;
-        const hasPayload = (data[offset + 3] & 0x10) !== 0;
-        const continuityCounter = data[offset + 3] & 0x0F;
-
-        // Update PID statistics
-        this.validationResults.pidStats.set(pid,
-            (this.validationResults.pidStats.get(pid) || 0) + 1);
-
-        // 3. Check for transport errors
-        if (transportError) {
-            this.onLog(`${this.TAG}: Transport error flag set at offset ${offset} for PID 0x${pid.toString(16)}`);
-            this.validationResults.structureErrors++;
-            return false;
+        
+        // Extract complete TS packets from the chunk
+        const packets = this._extractCompletePackets(data, streamId);
+        if (!packets || packets.length === 0) {
+            return null;
         }
-
-        // 4. Validate continuity counter
-        if (this.continuityCounters.has(pid)) {
-            const expectedCC = (this.continuityCounters.get(pid) + 1) & 0x0F;
-            if (continuityCounter !== expectedCC) {
-                this.onLog(`${this.TAG}: Continuity counter error for PID 0x${pid.toString(16)}: ` +
-                    `expected ${expectedCC}, got ${continuityCounter}`);
-                this.validationResults.continuityErrors++;
+        
+        // Process each packet: extract PTS, validate, and enqueue
+        const processedPackets = this._processAndSortPackets(packets, streamId, packetValidator);
+        
+        // Check if we need to flush the buffer
+        const shouldFlush = this.orderedPacketBuffer.length >= this.config.flushThreshold;
+        
+        return {
+            streamId,
+            packetCount: processedPackets,
+            shouldFlush,
+            hasTransition: this.isInTransition,
+            ptsRange: this.streamPTSRanges.get(streamId)
+        };
+    }
+    
+    /**
+     * Mark a stream as ended, process any remaining data
+     * @param {string} streamId - Stream identifier
+     */
+    endStream(streamId) {
+        if (this.activeStreamIds.has(streamId)) {
+            this.onLog(`Stream ended: ${streamId}`);
+            this.activeStreamIds.delete(streamId);
+            
+            // Check if there are no more active streams
+            if (this.activeStreamIds.size === 0) {
+                this.onLog(`All streams ended, flushing any remaining data`);
+                // Force a flush of any remaining data
+                return this.flushBuffers();
+            }
+            
+            // If the stream transition period is over, update state
+            if (this.isInTransition && Date.now() - this.lastStreamTransitionTime > this.config.maxBufferTime) {
+                this.isInTransition = false;
+                this.onLog(`Stream transition period ended, normal processing resumed`);
             }
         }
-        this.continuityCounters.set(pid, continuityCounter);
-
-        // 5. Validate adaptation field if present
-        if (hasAdaptation) {
-            const adaptationLength = data[offset + 4];
-
-            if (adaptationLength > 183) {
-                this.onLog(`${this.TAG}: Invalid adaptation field length ${adaptationLength} at offset ${offset}`);
-                this.validationResults.structureErrors++;
-                return false;
-            }
+        return null;
+    }
+    
+    /**
+     * Flush the ordered packet buffer and return packets for demuxing
+     * @returns {Array} - Array of ordered TS packets
+     */
+    flushBuffers() {
+        if (this.orderedPacketBuffer.length === 0) {
+            return [];
         }
-
-        // 6. Check payload start indicator and PES header if applicable
-        if (payloadStart && hasPayload) {
-            this.validationResults.pesPackets++;
-
-            const payloadOffset = hasAdaptation ? offset + 5 + data[offset + 4] : offset + 4;
-
-            // Validate PES header if we have enough data
-            if (payloadOffset + 9 <= offset + this.packetSize) {
-                if (data[payloadOffset] === 0x00 &&
-                    data[payloadOffset + 1] === 0x00 &&
-                    data[payloadOffset + 2] === 0x01) {
-
-                    // Check for PTS
-                    if (payloadOffset + 14 <= offset + this.packetSize) {
-                        const ptsDtsFlags = (data[payloadOffset + 7] & 0xC0) >> 6;
-
-                        if (ptsDtsFlags > 0) {
-                            // Validate PTS marker bits
-                            const p0 = data[payloadOffset + 9];
-                            if ((p0 & 0xF0) >> 4 !== 0x2 && (p0 & 0xF0) >> 4 !== 0x3) {
-                                this.onLog(`${this.TAG}: Invalid PTS marker bits: 0x${p0.toString(16)}`);
-                            } else {
-                                this.validationResults.validPTS++;
-                            }
-                        }
+        
+        // Sort the buffer by sequence number to ensure proper order
+        this.orderedPacketBuffer.sort((a, b) => a.sequence - b.sequence);
+        
+        // Extract just the packet data, discard the metadata
+        const packets = this.orderedPacketBuffer.map(item => item.packet);
+        
+        // Update statistics
+        this.stats.packetsOutputted += packets.length;
+        
+        // Clear the buffer
+        this.orderedPacketBuffer = [];
+        
+        this.onLog(`Flushed ${packets.length} packets to decoder`);
+        return packets;
+    }
+    
+    /**
+     * Extract complete 188-byte MPEG-TS packets from a data chunk
+     * @param {Uint8Array} data - Raw data chunk
+     * @param {string} streamId - Stream identifier
+     * @returns {Array} - Array of complete TS packets
+     */
+    _extractCompletePackets(data, streamId) {
+        if (!data || data.length === 0) {
+            return [];
+        }
+        
+        // Get the existing buffer for this stream
+        const streamBuffer = this.streamBuffers.get(streamId) || [];
+        
+        // Append new data
+        let combinedBuffer;
+        if (streamBuffer.length > 0) {
+            combinedBuffer = new Uint8Array(streamBuffer.length + data.length);
+            combinedBuffer.set(streamBuffer, 0);
+            combinedBuffer.set(data, streamBuffer.length);
+        } else {
+            combinedBuffer = data;
+        }
+        
+        // Find the first sync byte (0x47)
+        let syncIndex = -1;
+        for (let i = 0; i < combinedBuffer.length; i++) {
+            if (combinedBuffer[i] === 0x47) {
+                // Verify we have multiple sync bytes at the right spacing
+                let validPattern = true;
+                for (let j = 1; j <= Math.min(3, Math.floor((combinedBuffer.length - i) / 188)); j++) {
+                    if (combinedBuffer[i + (j * 188)] !== 0x47) {
+                        validPattern = false;
+                        break;
                     }
+                }
+                if (validPattern) {
+                    syncIndex = i;
+                    break;
                 }
             }
         }
-
-        // 7. All checks passed
-        this.validationResults.validPackets++;
-        return true;
+        
+        if (syncIndex === -1) {
+            // No valid sync pattern found, store the data for next time
+            this.streamBuffers.set(streamId, combinedBuffer);
+            return [];
+        }
+        
+        if (syncIndex > 0) {
+            // Remove data before the first sync byte
+            combinedBuffer = combinedBuffer.slice(syncIndex);
+        }
+        
+        // Calculate how many complete packets we have
+        const completePackets = Math.floor(combinedBuffer.length / 188);
+        if (completePackets === 0) {
+            // Not enough data for a complete packet, store for next time
+            this.streamBuffers.set(streamId, combinedBuffer);
+            return [];
+        }
+        
+        // Extract complete packets
+        const packets = [];
+        for (let i = 0; i < completePackets; i++) {
+            const packetStart = i * 188;
+            packets.push(combinedBuffer.slice(packetStart, packetStart + 188));
+        }
+        
+        // Store any remaining data for next time
+        const remainingData = combinedBuffer.slice(completePackets * 188);
+        this.streamBuffers.set(streamId, remainingData);
+        
+        return packets;
     }
-
-    // Generate a human-readable report
-    generateReport() {
-        const summary = `
-============ MPEG-TS Test Harness Report ============
-Total chunks processed: ${this.validationResults.totalChunks}
-Valid chunks: ${this.validationResults.validChunks} (${(this.validationResults.validChunks / this.validationResults.totalChunks * 100).toFixed(1)}%)
-Total packets: ${this.validationResults.totalPackets}
-Valid packets: ${this.validationResults.validPackets} (${(this.validationResults.validPackets / this.validationResults.totalPackets * 100).toFixed(1)}%)
-PES packets: ${this.validationResults.pesPackets}
-Valid PTS values: ${this.validationResults.validPTS}
-Continuity errors: ${this.validationResults.continuityErrors}
-Alignment errors: ${this.validationResults.alignmentErrors}
-Structure errors: ${this.validationResults.structureErrors}
-
-PID distribution:`;
-
-        let pidInfo = '';
-        for (const [pid, count] of this.validationResults.pidStats.entries()) {
-            pidInfo += `\n  PID 0x${pid.toString(16).padStart(4, '0')}: ${count} packets (${(count / this.validationResults.totalPackets * 100).toFixed(1)}%)`;
-
-            // Add interpretation for common PIDs
-            if (pid === 0x0000) {
-                pidInfo += " - Program Association Table (PAT)";
-            } else if (pid === 0x0001) {
-                pidInfo += " - Conditional Access Table (CAT)";
-            } else if (pid === 0x1FFF) {
-                pidInfo += " - Null packets";
-            } else if (pid === 0x1000 || pid === 0x0100 || pid === 0x4096) {
-                pidInfo += " - Likely Program Map Table (PMT)";
-            } else if (pid === 256 || pid === 0x1100 || pid === 0x0041) {
-                pidInfo += " - Video elementary stream";
-            } else if (pid === 257 || pid === 0x1200 || pid === 0x0043) {
-                pidInfo += " - Audio elementary stream";
+    
+    /**
+     * Process packets: extract PTS, validate, and enqueue in PTS order
+     * @param {Array} packets - Array of MPEG-TS packets
+     * @param {string} streamId - Stream identifier
+     * @param {Object} packetValidator - The TS packet validator to use
+     * @returns {number} - Number of processed packets
+     */
+    _processAndSortPackets(packets, streamId, packetValidator) {
+        if (!packets || packets.length === 0) {
+            return 0;
+        }
+        
+        const ptsRange = this.streamPTSRanges.get(streamId) || { firstPTS: null, lastPTS: null };
+        let processedCount = 0;
+        
+        for (let i = 0; i < packets.length; i++) {
+            const packet = packets[i];
+            this.stats.packetsProcessed++;
+            
+            // Basic packet validation
+            if (packet[0] !== 0x47) {
+                continue; // Skip invalid packets
             }
-        }
-
-        // Add assessment of stream quality
-        let assessment = "\nOverall assessment: ";
-
-        if (this.validationResults.validPackets === 0) {
-            assessment += "CRITICAL - No valid packets found";
-        } else if (this.validationResults.validPackets / this.validationResults.totalPackets < 0.8) {
-            assessment += "POOR - Less than 80% of packets are valid";
-        } else if (this.validationResults.structureErrors > 0 || this.validationResults.alignmentErrors > 0) {
-            assessment += "PROBLEMATIC - Contains structural errors";
-        } else if (this.validationResults.continuityErrors > 0) {
-            assessment += "FAIR - Contains continuity errors but basic structure is valid";
-        } else if (!this.validationResults.pidStats.has(0x0000)) {
-            assessment += "INCOMPLETE - Missing Program Association Table (PAT)";
-        } else if (this.validationResults.validPTS === 0) {
-            assessment += "PROBLEMATIC - No valid PTS values found";
-        } else {
-            assessment += "GOOD - Stream appears to be well-formed";
-        }
-
-        // Add recommendations based on findings
-        let recommendations = "\n\nRecommendations:";
-
-        if (this.validationResults.alignmentErrors > 0) {
-            recommendations += "\n- Fix packet alignment by ensuring chunks are multiples of 188 bytes";
-            recommendations += "\n- Ensure sync bytes (0x47) occur at the start of each 188-byte packet";
-        }
-
-        if (this.validationResults.structureErrors > 0) {
-            recommendations += "\n- Check adaptation field lengths and packet structure";
-            recommendations += "\n- Verify PES header formation, especially for packets with payload_unit_start_indicator set";
-        }
-
-        if (this.validationResults.continuityErrors > 0) {
-            recommendations += "\n- Investigate packet loss or reordering in the transport layer";
-            recommendations += "\n- Ensure packets for each PID maintain proper continuity counter sequence";
-        }
-
-        if (!this.validationResults.pidStats.has(0x0000)) {
-            recommendations += "\n- Ensure PAT packets are included in the stream";
-        }
-
-        if (this.validationResults.validPTS === 0 && this.validationResults.pesPackets > 0) {
-            recommendations += "\n- Check PTS extraction logic and PES header formation";
-        }
-
-        return summary + pidInfo + assessment + recommendations;
-    }
-
-    // Integrate with your WebTransportLoader class
-    integrateWithLoader(loader) {
-        const originalDispatchMethod = loader._dispatchPacketChunk.bind(loader);
-
-        // Override the dispatch method to add validation
-        loader._dispatchPacketChunk = () => {
-            if (loader._packetBuffer.length === 0) return;
-
-            // Combine packets into a single chunk
-            const totalLength = loader._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
-            const chunk = new Uint8Array(totalLength);
-
-            let offset = 0;
-            loader._packetBuffer.forEach(packet => {
-                chunk.set(packet, offset);
-                offset += packet.length;
+            
+            // Extract packet information
+            const pid = ((packet[1] & 0x1F) << 8) | packet[2];
+            const payloadStart = (packet[1] & 0x40) !== 0;
+            const hasAdaptationField = (packet[3] & 0x20) !== 0;
+            const hasPayload = (packet[3] & 0x10) !== 0;
+            
+            // Find PTS in the packet if it's the start of a PES packet
+            let pts = null;
+            if (payloadStart && hasPayload) {
+                pts = this._extractPTS(packet, hasAdaptationField);
+                
+                // Update PTS range for this stream
+                if (pts !== null) {
+                    if (ptsRange.firstPTS === null) {
+                        ptsRange.firstPTS = pts;
+                    }
+                    ptsRange.lastPTS = pts;
+                    
+                    // During transitions, detect overlapping PTS ranges between streams
+                    if (this.isInTransition && this.activeStreamIds.size > 1) {
+                        this._detectStreamOverlap(streamId, pts);
+                    }
+                }
+            }
+            
+            // Assign a global sequence number for proper ordering
+            const sequence = this.outputSequence++;
+            
+            // Add to ordered buffer
+            this.orderedPacketBuffer.push({
+                packet,
+                streamId,
+                pts: pts,
+                sequence,
+                transitionSequence: this.transitionSequenceCounter
             });
+            
+            processedCount++;
+        }
+        
+        // Update the PTS range for this stream
+        this.streamPTSRanges.set(streamId, ptsRange);
+        
+        return processedCount;
+    }
 
-            // Validate the chunk
-            const isValid = this.validateChunk(chunk.buffer);
-
-            if (!isValid) {
-                loader.onLog(`${this.TAG}: Invalid chunk detected, validation report follows:`);
-                loader.onLog(this.generateReport());
+/**
+     * Extract PTS from a TS packet if it contains a PES header
+     * @param {Uint8Array} packet - TS packet data
+     * @param {boolean} hasAdaptationField - Whether the packet has an adaptation field
+     * @returns {number|null} - PTS value or null if not found
+     */
+    _extractPTS(packet, hasAdaptationField) {
+        try {
+            // Calculate payload offset
+            const payloadOffset = hasAdaptationField ? 
+                (5 + packet[4]) : 4;
+            
+            // Ensure we have enough bytes for a PES header
+            if (packet.length < payloadOffset + 14) {
+                return null;
             }
-
-            // Call the original method
-            originalDispatchMethod();
+            
+            // Check for PES start code (0x000001)
+            if (packet[payloadOffset] !== 0x00 || 
+                packet[payloadOffset + 1] !== 0x00 || 
+                packet[payloadOffset + 2] !== 0x01) {
+                return null;
+            }
+            
+            // Check stream ID for video or audio
+            const streamId = packet[payloadOffset + 3];
+            if ((streamId < 0xE0 || streamId > 0xEF) && // Not video
+                (streamId < 0xC0 || streamId > 0xDF)) { // Not audio
+                return null;
+            }
+            
+            // Check PTS_DTS_flags
+            const ptsDtsFlags = (packet[payloadOffset + 7] & 0xC0) >> 6;
+            if (ptsDtsFlags === 0) {
+                return null; // No PTS present
+            }
+            
+            // Extract PTS (33-bit value spread across 5 bytes)
+            const p0 = packet[payloadOffset + 9];
+            const p1 = packet[payloadOffset + 10];
+            const p2 = packet[payloadOffset + 11];
+            const p3 = packet[payloadOffset + 12];
+            const p4 = packet[payloadOffset + 13];
+            
+            // Combine the bytes according to MPEG-TS spec
+            const pts = (((p0 >> 1) & 0x07) << 30) | 
+                       (p1 << 22) | 
+                       (((p2 >> 1) & 0x7F) << 15) | 
+                       (p3 << 7) | 
+                       ((p4 >> 1) & 0x7F);
+                       
+            return pts;
+        } catch (e) {
+            // Log the error but don't let it crash the main process
+            this.onLog(`Error extracting PTS: ${e.message}`);
+            return null;
+        }
+    }
+    
+    /**
+     * Detect overlapping PTS ranges between streams during transition
+     * @param {string} currentStreamId - Current stream ID
+     * @param {number} currentPTS - Current PTS value
+     */
+    _detectStreamOverlap(currentStreamId, currentPTS) {
+        // Check all active streams except the current one
+        for (const otherStreamId of this.activeStreamIds) {
+            if (otherStreamId === currentStreamId) continue;
+            
+            const otherRange = this.streamPTSRanges.get(otherStreamId);
+            if (!otherRange || otherRange.firstPTS === null) continue;
+            
+            // Check if the current PTS falls within the other stream's range
+            if (currentPTS >= otherRange.firstPTS && 
+                currentPTS <= otherRange.lastPTS) {
+                this.stats.streamOverlaps++;
+                this.onLog(`PTS overlap detected between streams: ${currentStreamId} and ${otherStreamId} at PTS ${currentPTS}`);
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Get the current statistics
+     * @returns {Object} - Statistics object
+     */
+    getStats() {
+        return {
+            ...this.stats,
+            activeStreams: this.activeStreamIds.size,
+            bufferedPackets: this.orderedPacketBuffer.length,
+            inTransition: this.isInTransition,
+            streamRanges: Object.fromEntries([...this.streamPTSRanges.entries()].map(
+                ([id, range]) => [id, {
+                    firstPTS: range.firstPTS,
+                    lastPTS: range.lastPTS
+                }]
+            ))
         };
-
-	    if (typeof this.onLog === 'function') {
-		this.onLog(`${this.TAG}: Successfully integrated with WebTransportLoader`);
-	    } else if (typeof loader.onLog === 'function') {
-		loader.onLog(`${this.TAG}: Successfully integrated with WebTransportLoader`);
-	    } else {
-		console.log(`${this.TAG}: Successfully integrated with WebTransportLoader`);
-	    }
-
-        return true;
+    }
+    
+    /**
+     * Reset the handler state
+     */
+    reset() {
+        this.streamBuffers.clear();
+        this.activeStreamIds.clear();
+        this.streamPTSRanges.clear();
+        this.orderedPacketBuffer = [];
+        this.outputSequence = 0;
+        this.globalPTSOffset = 0;
+        this.lastGlobalPTS = null;
+        this.isInTransition = false;
+        this.transitionSequenceCounter = 0;
+        
+        // Reset stats
+        this.stats = {
+            streamsReceived: 0,
+            streamsSwitched: 0,
+            ptsJumps: 0,
+            packetsProcessed: 0,
+            packetsOutputted: 0,
+            discontinuities: 0,
+            streamOverlaps: 0
+        };
+        
+        this.onLog('Stream rotation handler reset');
     }
 }
 
+/**
+ * TS Packet Validator - checks for valid MPEG-TS packet structure
+ */
 class TSPacketValidator {
     constructor(options = {}) {
         this.PACKET_SIZE = 188;
@@ -320,7 +461,7 @@ class TSPacketValidator {
         this.onLog = options.onLog || console.log;
     }
 
-isLikelyValidPacketStart(buffer, index) {
+    isLikelyValidPacketStart(buffer, index) {
         // Ensure we have enough bytes to check
         if (buffer.length < index + this.PACKET_SIZE) return false;
 
@@ -392,24 +533,24 @@ isLikelyValidPacketStart(buffer, index) {
         const bytes = Array.from(buffer.slice(start, start + length))
             .map(b => b.toString(16).padStart(2, '0'))
             .join(' ');
-        //this.onLog(`[RAW] Bytes at ${start}: ${bytes}`);
     }
 
     logVideoPacketDetails(buffer, index, payloadStart, hasAdaptationField, continuityCounter) {
         const payloadOffset = hasAdaptationField ? 5 + buffer[index + 4] : 4;
 
-        //this.onLog(`[DEBUG] Video packet at ${index}: START=${payloadStart}, AF=${hasAdaptationField}, CC=${continuityCounter}`);
-
         if (payloadStart && buffer.length >= index + payloadOffset + 4) {
             const startCode = buffer.slice(index + payloadOffset, index + payloadOffset + 4);
             if (startCode[0] === 0x00 && startCode[1] === 0x00 &&
                 startCode[2] === 0x00 && startCode[3] === 0x01) {
-                //this.onLog(`[DEBUG] Valid H.264 start code found at offset ${payloadOffset}`);
+                // Valid H.264 start code found
             }
         }
     }
 }
 
+/**
+ * MPEG-TS Buffer - manages and processes MPEG-TS data chunks
+ */
 class MPEGTSBuffer {
     constructor(onLog) {
         this.PACKET_SIZE = 188;
@@ -419,7 +560,6 @@ class MPEGTSBuffer {
         this.onLog = onLog || (() => {});
         this.validator = new TSPacketValidator({ onLog: this.onLog });
 
-        
         // Add validation statistics
         this.stats = {
             totalPacketsProcessed: 0,
@@ -431,22 +571,16 @@ class MPEGTSBuffer {
         };
     }
 
-    addChunk(chunk) {
+addChunk(chunk) {
         if (!chunk || chunk.length === 0) return null;
 
         const inputChunk = (chunk instanceof Uint8Array) ? chunk : new Uint8Array(chunk);
-
-        // Log incoming chunk details
-        //this.onLog(`Processing new chunk of ${inputChunk.length} bytes`);
 
         // Append new data to existing buffer
         let newBuffer = new Uint8Array(this.buffer.length + inputChunk.length);
         newBuffer.set(this.buffer, 0);
         newBuffer.set(inputChunk, this.buffer.length);
         this.buffer = newBuffer;
-
-        // Log buffer state
-        //this.onLog(`Total buffer size after append: ${this.buffer.length} bytes`);
 
         // Find first valid sync byte
         let syncIndex = this.findSyncByte(this.buffer);
@@ -473,127 +607,87 @@ class MPEGTSBuffer {
         return this.validatePackets(packetsData);
     }
 
-	validatePackets(packets) {
-	    const validPackets = [];
-	    
-	    try {
-		for (let i = 0; i < packets.length; i += this.PACKET_SIZE) {
-		    // Ensure we have enough bytes for a complete packet
-		    if (i + this.PACKET_SIZE > packets.length) {
-			//this.onLog(`[WARNING] Incomplete packet at end of buffer: ${packets.length - i} bytes`);
-			break;
-		    }
-		    
-		    this.stats.totalPacketsProcessed++;
-		    const currentPacket = packets.slice(i, i + this.PACKET_SIZE);
-		    
-		    // Basic check for sync byte
-		    if (currentPacket[0] !== this.SYNC_BYTE) {
-			this.stats.invalidPackets++;
-			this.stats.invalidSyncByteCount++;
-			continue;
-		    }
+    validatePackets(packets) {
+        const validPackets = [];
+        
+        try {
+            for (let i = 0; i < packets.length; i += this.PACKET_SIZE) {
+                // Ensure we have enough bytes for a complete packet
+                if (i + this.PACKET_SIZE > packets.length) {
+                    break;
+                }
+                
+                this.stats.totalPacketsProcessed++;
+                const currentPacket = packets.slice(i, i + this.PACKET_SIZE);
+                
+                // Basic check for sync byte
+                if (currentPacket[0] !== this.SYNC_BYTE) {
+                    this.stats.invalidPackets++;
+                    this.stats.invalidSyncByteCount++;
+                    continue;
+                }
 
-		    // Extract packet information
-		    const pid = ((currentPacket[1] & 0x1F) << 8) | currentPacket[2];
-		    const hasAdaptationField = (currentPacket[3] & 0x20) !== 0;
-		    const hasPayload = (currentPacket[3] & 0x10) !== 0;
-		    const payloadStart = (currentPacket[1] & 0x40) !== 0;
-		    
-		    // Update statistics
-		    this.stats.validPackets++;
-		    this.stats.pidDistribution.set(pid, (this.stats.pidDistribution.get(pid) || 0) + 1);
-		    if (hasAdaptationField) {
-			this.stats.adaptationFieldCount++;
-		    }
-		    
-		    // Special handling for video packets - check for PID 256 (0x100)
-		    // Also check the usual video PIDs as a fallback
-		    if ((pid === 0x100 || pid === 0x0041 || pid === 0xE0) && hasPayload) {
-			const payloadOffset = hasAdaptationField ? 5 + currentPacket[4] : 4;
-			
-			if (payloadStart && currentPacket.length >= payloadOffset + 9) {
-			    // Check for PES start code
-			    if (currentPacket[payloadOffset] === 0x00 && 
-				currentPacket[payloadOffset + 1] === 0x00 &&
-				currentPacket[payloadOffset + 2] === 0x01) {
-				
-				const streamID = currentPacket[payloadOffset + 3];
-				const ptsDtsFlags = (currentPacket[payloadOffset + 7] & 0xC0) >> 6;
-				
-				// Check for PTS
-				if (ptsDtsFlags > 0 && currentPacket.length >= payloadOffset + 14) {
-				    const ptsBytes = Array.from(currentPacket.slice(payloadOffset + 9, payloadOffset + 14))
-					.map(b => b.toString(16).padStart(2, '0'))
-					.join(' ');
-				    //this.onLog(`[DEBUG] PTS bytes for PID ${pid.toString(16)}: ${ptsBytes}`);
-				}
-			    }
-			}
-		    }
-		    
-		    validPackets.push(currentPacket);
-		}
+                // Extract packet information
+                const pid = ((currentPacket[1] & 0x1F) << 8) | currentPacket[2];
+                const hasAdaptationField = (currentPacket[3] & 0x20) !== 0;
+                const hasPayload = (currentPacket[3] & 0x10) !== 0;
+                const payloadStart = (currentPacket[1] & 0x40) !== 0;
+                
+                // Update statistics
+                this.stats.validPackets++;
+                this.stats.pidDistribution.set(pid, (this.stats.pidDistribution.get(pid) || 0) + 1);
+                if (hasAdaptationField) {
+                    this.stats.adaptationFieldCount++;
+                }
+                
+                validPackets.push(currentPacket);
+            }
 
-		// Log periodic statistics
-		if (this.stats.totalPacketsProcessed % 1000 === 0) {
-		    try {
-			if (typeof this.logStats === 'function') {
-			    //this.logStats();
-			} else {
-			    // Fallback minimal logging
-			    // this.onLog(`MPEGTS Buffer Stats: Total=${this.stats.totalPacketsProcessed}, Valid=${this.stats.validPackets}`);
-			}
-		    } catch (e) {
-			this.onLog(`[ERROR] Error logging stats: ${e.message}`);
-		    }
-		}
+            return validPackets.length > 0 ? validPackets : null;
+        } catch (error) {
+            this.onLog(`[ERROR] Error in validatePackets: ${error.message}`);
+            return validPackets.length > 0 ? validPackets : null;
+        }
+    }
 
-		return validPackets.length > 0 ? validPackets : null;
-	    } catch (error) {
-		this.onLog(`[ERROR] Error in validatePackets: ${error.message}`);
-		return validPackets.length > 0 ? validPackets : null;
-	    }
-	}
-
-	findSyncByte(buffer) {
-	    // Check every possible position within the buffer
-	    for (let i = 0; i <= buffer.length - this.PACKET_SIZE; i++) {
-		if (buffer[i] === this.SYNC_BYTE) {
-		    // Check if we have multiple sync bytes at the expected spacing
-		    let validSyncCount = 1;
-		    
-		    // Look for up to 3 more sync bytes at PACKET_SIZE intervals
-		    for (let j = 1; j <= 3; j++) {
-			const nextSyncPos = i + (j * this.PACKET_SIZE);
-			if (nextSyncPos < buffer.length && buffer[nextSyncPos] === this.SYNC_BYTE) {
-			    validSyncCount++;
-			} else {
-			    break;
-			}
-		    }
-		    
-		    // If we found at least 2 sync bytes at the right spacing, it's likely a valid start
-		    if (validSyncCount >= 2) {
-			//this.onLog(`[INFO] Found ${validSyncCount} consecutive sync bytes at position ${i}`);
-			return i;
-		    }
-		}
-	    }
-	    
-	    // Fallback: return the first sync byte we find, even if it doesn't have follow-ups
-	    for (let i = 0; i <= buffer.length - this.PACKET_SIZE; i++) {
-		if (buffer[i] === this.SYNC_BYTE) {
-		    //this.onLog(`[INFO] Found single sync byte at position ${i} (no follow-ups)`);
-		    return i;
-		}
-	    }
-	    
-	    return -1;
-	}
-
+    findSyncByte(buffer) {
+        // Check every possible position within the buffer
+        for (let i = 0; i <= buffer.length - this.PACKET_SIZE; i++) {
+            if (buffer[i] === this.SYNC_BYTE) {
+                // Check if we have multiple sync bytes at the expected spacing
+                let validSyncCount = 1;
+                
+                // Look for up to 3 more sync bytes at PACKET_SIZE intervals
+                for (let j = 1; j <= 3; j++) {
+                    const nextSyncPos = i + (j * this.PACKET_SIZE);
+                    if (nextSyncPos < buffer.length && buffer[nextSyncPos] === this.SYNC_BYTE) {
+                        validSyncCount++;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // If we found at least 2 sync bytes at the right spacing, it's likely a valid start
+                if (validSyncCount >= 2) {
+                    return i;
+                }
+            }
+        }
+        
+        // Fallback: return the first sync byte we find, even if it doesn't have follow-ups
+        for (let i = 0; i <= buffer.length - this.PACKET_SIZE; i++) {
+            if (buffer[i] === this.SYNC_BYTE) {
+                return i;
+            }
+        }
+        
+        return -1;
+    }
 }
 
+/**
+ * Packet Logger - tracks and analyzes MPEG-TS packet details
+ */
 class PacketLogger {
     constructor(onLog) {
         this.packetCount = 0;
@@ -621,1438 +715,404 @@ class PacketLogger {
         };
     }
 
-	debugPTS(rawBytes) {
-	    // Input is array of 5 bytes, as extracted from PES header
-	    if (!Array.isArray(rawBytes) || rawBytes.length !== 5) {
-		this.onLog(`[ERROR] Invalid PTS bytes array: ${rawBytes}`);
-		return;
-	    }
-	    
-	    const [p0, p1, p2, p3, p4] = rawBytes;
-	    
-		/*
-	    this.onLog(`
-	PTS Breakdown:
-	=============
-	Raw bytes: ${rawBytes.map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ')}
+    logPacket(packet, timeReceived) {
+        if (!packet || !(packet instanceof Uint8Array) || packet.length !== 188) {
+            return;
+        }
 
-	Byte 1 (0x${p0.toString(16).padStart(2, '0')}): ${p0.toString(2).padStart(8, '0')}
-	   Should start with 0010 (prefix) and end with 1 (marker bit)
-	   Actual: starts with ${(p0 >> 4).toString(2).padStart(4, '0')}, ends with ${p0 & 0x01}
-	   Bits 32-30 of PTS: ${((p0 >> 1) & 0x07).toString(2).padStart(3, '0')}
+        this.packetCount++;
+        this.debugStats.totalPackets++;
 
-	Byte 2 (0x${p1.toString(16).padStart(2, '0')}): ${p1.toString(2).padStart(8, '0')}
-	   Contains bits 29-22 of PTS
+        if (packet[0] !== 0x47) return;
 
-	Byte 3 (0x${p2.toString(16).padStart(2, '0')}): ${p2.toString(2).padStart(8, '0')}
-	   Should end with 1 (marker bit)
-	   Actual: ends with ${p2 & 0x01}
-	   Bits 21-15 of PTS: ${((p2 >> 1) & 0x7F).toString(2).padStart(7, '0')}
+        // Extract packet info
+        const pid = ((packet[1] & 0x1F) << 8) | packet[2];
+        const payloadUnitStart = (packet[1] & 0x40) !== 0;
+        const hasAdaptationField = (packet[3] & 0x20) !== 0;
+        const hasPayload = (packet[3] & 0x10) !== 0;
 
-	Byte 4 (0x${p3.toString(16).padStart(2, '0')}): ${p3.toString(2).padStart(8, '0')}
-	   Contains bits 14-7 of PTS
+        if (pid === this.videoPID && hasPayload) {
+            this.debugStats.videoPIDPackets++;
+            
+            // Calculate payload start
+            let payloadOffset = 4;
+            let randomAccessIndicator = 0;
+            
+            if (hasAdaptationField) {
+                if (packet.length < 5) return;
+                const adaptationFieldLength = packet[4];
+                
+                // Check for random access indicator in adaptation field
+                if (adaptationFieldLength > 0 && packet.length >= 6) {
+                    // Adaptation field flags byte
+                    const adaptationFlags = packet[5];
+                    randomAccessIndicator = (adaptationFlags & 0x40) >> 6;
+                }
+                
+                if (adaptationFieldLength > 183) return;
+                payloadOffset = 5 + adaptationFieldLength;
+            }
 
-	Byte 5 (0x${p4.toString(16).padStart(2, '0')}): ${p4.toString(2).padStart(8, '0')}
-	   Should end with 1 (marker bit)
-	   Actual: ends with ${p4 & 0x01}
-	   Bits 6-0 of PTS: ${((p4 >> 1) & 0x7F).toString(2).padStart(7, '0')}
+            if (payloadOffset >= packet.length) return;
 
-	Calculated PTS value:
-	${(((p0 >> 1) & 0x07) << 30) | 
-	  (p1 << 22) | 
-	  (((p2 >> 1) & 0x7F) << 15) | 
-	  (p3 << 7) | 
-	  ((p4 >> 1) & 0x7F)}
-
-	Standard calculation (ignoring marker bits):
-	${(((p0 >> 1) & 0x07) << 30) | 
-	  (p1 << 22) | 
-	  (((p2 >> 1) & 0x7F) << 15) | 
-	  (p3 << 7) | 
-	  ((p4 >> 1) & 0x7F)}
-
-	Alternative calculation (forcing marker bits):
-	${(((p0 >> 1) & 0x07) << 30) | 
-	  (p1 << 22) | 
-	  (((p2 | 0x01) >> 1) << 15) | 
-	  (p3 << 7) | 
-	  (((p4 | 0x01) >> 1) & 0x7F)}
-	`);
-*/
-	    return (((p0 >> 1) & 0x07) << 30) | 
-		   (p1 << 22) | 
-		   (((p2 >> 1) & 0x7F) << 15) | 
-		   (p3 << 7) | 
-		   ((p4 >> 1) & 0x7F);
-	}
-
-    _formatBits(byte) {
-        return byte.toString(2).padStart(8, '0');
+            if (payloadUnitStart) {
+                this.debugStats.pesStarts++;
+                const payload = packet.slice(payloadOffset);
+                
+                let pts = this._extractPTS(payload);
+                if (pts !== null) {
+                    this.debugStats.validPTS++;
+                    pts = this._handleWraparound(pts);
+                    this.lastValidPTS = pts;
+                    this.lastVideoPTS = pts;
+                    
+                    this.debugStats.pts.push(pts);
+                    if (this.debugStats.pts.length > 5) {
+                        this.debugStats.pts.shift();
+                    }
+                }
+            }
+        }
     }
 
-	_detectPTSDiscontinuity(pts) {
-	    if (this.prevPTS !== null) {
-		const diff = pts - this.prevPTS;
-		// Check for large gaps or backwards jumps
-		if (Math.abs(diff) > 900000) { // 10-second gap
-		    Log.w(this.TAG, `Large PTS discontinuity detected: ${diff / 90000} seconds`);
-		    return true;
-		}
-	    }
-	    this.prevPTS = pts;
-	    return false;
-	}
+    _extractPTS(payload) {
+        // Ensure there is enough data and a valid PES start
+        if (payload.length < 14) {
+            this.debugStats.noPTS++;
+            return null;
+        }
+        
+        if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) {
+            this.debugStats.notPESHeader++;
+            return null;
+        }
+        
+        // Check for video stream ID - could be 0xE0-0xEF for video
+        if (payload[3] < 0xE0 || payload[3] > 0xEF) {
+            this.debugStats.notPESHeader++;
+            return null;
+        }
+        
+        const ptsDtsFlags = (payload[7] & 0xC0) >> 6;
+        if (ptsDtsFlags === 0) {
+            this.debugStats.noPTS++;
+            return null;
+        }
 
-	logPacket(packet, timeReceived) {
-	    if (!packet || !(packet instanceof Uint8Array) || packet.length !== 188) {
-		return;
-	    }
-
-	    this.packetCount++;
-	    this.debugStats.totalPackets++;
-
-	    if (packet[0] !== 0x47) return;
-
-	    // Extract packet info
-	    const pid = ((packet[1] & 0x1F) << 8) | packet[2];
-	    const payloadUnitStart = (packet[1] & 0x40) !== 0;
-	    const hasAdaptationField = (packet[3] & 0x20) !== 0;
-	    const hasPayload = (packet[3] & 0x10) !== 0;
-
-	if (this._checkForH264IFrame(payload, payloadOffset)) {
-	    //Log.v(this.TAG, `I-frame detected at PTS ${this.lastValidPTS}`);
-	    // Track keyframes for debugging
-	    if (!this.keyframes) this.keyframes = [];
-	    this.keyframes.push({
-		pts: this.lastValidPTS,
-		packetCount: this.packetCount,
-		timeReceived: Date.now()
-	    });
-	}
-
-	    if (pid === this.videoPID && hasPayload) {
-		this.debugStats.videoPIDPackets++;
-		
-		// Calculate payload start
-		let payloadOffset = 4;
-		let randomAccessIndicator = 0;
-		
-		if (hasAdaptationField) {
-		    if (packet.length < 5) return;
-		    const adaptationFieldLength = packet[4];
-		    
-		    // Check for random access indicator in adaptation field
-		    if (adaptationFieldLength > 0 && packet.length >= 6) {
-			// Adaptation field flags byte
-			const adaptationFlags = packet[5];
-			randomAccessIndicator = (adaptationFlags & 0x40) >> 6;
-			
-			if (randomAccessIndicator === 1) {
-			    //this.onLog(`[INFO] Random Access Indicator found at packet #${this.packetCount}`);
-			}
-		    }
-		    
-		    if (adaptationFieldLength > 183) return;
-		    payloadOffset = 5 + adaptationFieldLength;
-		}
-
-		if (payloadOffset >= packet.length) return;
-
-		if (payloadUnitStart) {
-		    this.debugStats.pesStarts++;
-		    const payload = packet.slice(payloadOffset);
-		    
-		    // Debug full PES header details
-		    this._debugPESHeaderDetailed(payload, randomAccessIndicator);
-		    
-		    // Check for H.264 NAL unit that might indicate an I-frame
-		    this._checkForH264IFrame(payload, payloadOffset);
-		    
-		    let pts = this._extractPTS(payload);
-		    if (pts !== null) {
-			this.debugStats.validPTS++;
-			pts = this._handleWraparound(pts);
-			this.lastValidPTS = pts;
-			this.lastVideoPTS = pts;
-			
-			this.debugStats.pts.push(pts);
-			if (this.debugStats.pts.length > 5) {
-			    this.debugStats.pts.shift();
-			}
-			
-			//this.onLog(`[INFO] Found PTS: ${pts} in video packet #${this.debugStats.videoPIDPackets}`);
-		    }
-		}
-	    }
-
-	    if (this.packetCount === 1 || this.packetCount === 100 || 
-		this.packetCount === 1000 || this.packetCount % 1000 === 0) {
-		//this._logDetailedStats(timeReceived);
-	    }
-	}
-
-	_checkForH264IFrame(payload, payloadOffset) {
-	    try {
-		// First ensure payload is defined
-		if (!payload || !payload.length) {
-		    return false;
-		}
-		
-		// Check if we have the start of a PES packet
-		if (payload.length < 9) {
-		    return false;
-		}
-		
-		if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) {
-		    return false;
-		}
-		
-		// Get to the actual video data after PES header
-		const pesHeaderLength = payload[8];
-		if (pesHeaderLength === undefined || 
-		    payload.length < 9 + pesHeaderLength + 5) {
-		    return false;
-		}
-		
-		// Move to video data (after PES header)
-		const videoData = payload.slice(9 + pesHeaderLength);
-		if (!videoData || !videoData.length) {
-		    return false;
-		}
-		
-		// Look for NAL units (start with 0x000001 or 0x00000001)
-		for (let i = 0; i < videoData.length - 5; i++) {
-		    // Check for NAL unit start code
-		    if ((videoData[i] === 0 && videoData[i+1] === 0 && videoData[i+2] === 1) ||
-			(videoData[i] === 0 && videoData[i+1] === 0 && videoData[i+2] === 0 && videoData[i+3] === 1)) {
-			
-			// Get NAL type - 5 is IDR (I-frame)
-			const startCodeSize = (videoData[i+2] === 1) ? 3 : 4;
-			
-			// Make sure we have enough data for the NAL type
-			if (i + startCodeSize >= videoData.length) {
-			    continue;
-			}
-			
-			const nalType = videoData[i + startCodeSize] & 0x1F;
-			
-			// NAL type 5 = IDR (I-frame)
-			if (nalType === 5) {
-			    return true;
-			}
-		    }
-		}
-		
-		return false;
-	    } catch (e) {
-		Log.e(this.TAG, `Error checking for I-frame: ${e.message}`);
-		return false;
-	    }
-	}
-
-	_debugPESHeaderDetailed(payload, randomAccessIndicator) {
-	    if (payload.length < 19) return;
-
-	    if (payload[0] === 0x00 && payload[1] === 0x00 && payload[2] === 0x01) {
-		const streamId = payload[3];
-		const pesPacketLength = (payload[4] << 8) | payload[5];
-		const scramblingControl = (payload[6] & 0x30) >> 4;
-		const priority = (payload[6] & 0x08) >> 3;
-		const dataAlignmentIndicator = (payload[6] & 0x04) >> 2;
-		const copyright = (payload[6] & 0x02) >> 1;
-		const originalOrCopy = payload[6] & 0x01;
-		const ptsDtsFlags = (payload[7] & 0xC0) >> 6;
-		const escrFlag = (payload[7] & 0x20) >> 5;
-		const esRateFlag = (payload[7] & 0x10) >> 4;
-		const dsmTrickModeFlag = (payload[7] & 0x08) >> 3;
-		const additionalCopyInfoFlag = (payload[7] & 0x04) >> 2;
-		const pesCrcFlag = (payload[7] & 0x02) >> 1;
-		const pesExtensionFlag = payload[7] & 0x01;
-		const pesHeaderLength = payload[8];
-
-		    /*
-		this.onLog(`PES Header Detailed Debug:
-		    Start Code: ${payload[0]},${payload[1]},${payload[2]}
-		    Stream ID: 0x${streamId.toString(16)}
-		    Packet Length: ${pesPacketLength}
-		    Scrambling Control: ${scramblingControl}
-		    Priority: ${priority}
-		    Data Alignment: ${dataAlignmentIndicator}
-		    Copyright: ${copyright}
-		    Original/Copy: ${originalOrCopy}
-		    PTS_DTS_flags: ${ptsDtsFlags}
-		    ESCR flag: ${escrFlag}
-		    ES Rate flag: ${esRateFlag}
-		    DSM Trick Mode: ${dsmTrickModeFlag}
-		    Additional Copy Info: ${additionalCopyInfoFlag}
-		    PES CRC flag: ${pesCrcFlag}
-		    PES Extension: ${pesExtensionFlag}
-		    PES Header Length: ${pesHeaderLength}
-		    Random Access Indicator: ${randomAccessIndicator}
-		    Raw PTS bytes: ${payload.slice(9, 14).map(b => b.toString(16).padStart(2, '0')).join(' ')}
-		    PTS byte details:
-			Byte 1 (0x${payload[9].toString(16).padStart(2, '0')}): ${this._formatBits(payload[9])}
-			Byte 2 (0x${payload[10].toString(16).padStart(2, '0')}): ${this._formatBits(payload[10])}
-			Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${this._formatBits(payload[11])}
-			Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${this._formatBits(payload[12])}
-			Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${this._formatBits(payload[13])}`);
-
-		     */
-
-		// Return an object with parsed header information
-		return {
-		    streamId,
-		    pesPacketLength,
-		    randomAccessIndicator,
-		    ptsDtsFlags,
-		    pesHeaderLength,
-		    // Add other fields as needed
-		};
-	    }
-	    return null;
-	}
-
-	logDetailedStatsConditional(timeReceived, payload) {
-	    // Only log for the 1st, 100th, 1000th, and every 1000th packet thereafter.
-	    if (this.packetCount === 1 || this.packetCount === 100 || this.packetCount % 1000 === 0) {
-		// Build Packet Stats message.
-		const pts = (this.lastValidPTS !== null)
-		    ? this.lastValidPTS
-		    : (this.packetCount * this.estimatedFrameDuration);
-		let statsMsg = `[WebTransportLoader] > Packet Stats #${this.packetCount}:\n`;
-		statsMsg += `            PTS: ${pts}\n`;
-		statsMsg += `            Received at: ${timeReceived}\n`;
-		statsMsg += `            Total Packets: ${this.debugStats.totalPackets}\n`;
-		statsMsg += `            Video PID (256) Packets: ${this.debugStats.videoPIDPackets}\n`;
-		statsMsg += `            PES Packet Starts: ${this.debugStats.pesStarts}\n`;
-		statsMsg += `            Valid PTS Found: ${this.debugStats.validPTS}\n`;
-		statsMsg += `            Not PES Header: ${this.debugStats.notPESHeader}\n`;
-		statsMsg += `            No PTS: ${this.debugStats.noPTS}\n`;
-		statsMsg += `            Last 5 PTS values: ${this.debugStats.pts.join(', ')}\n`;
-		//this.onLog(statsMsg);
-
-		// Log PES Header Detailed Debug if the payload is available.
-		if (payload && payload.length >= 14) {
-		    let headerMsg = `[WebTransportLoader] > PES Header Detailed Debug:\n`;
-		    headerMsg += `                Start Code: ${payload[0]},${payload[1]},${payload[2]}\n`;
-		    headerMsg += `                Stream ID: 0x${payload[3].toString(16)}\n`;
-		    headerMsg += `                Packet Length: ${(payload[4] << 8) | payload[5]}\n`;
-		    headerMsg += `                Scrambling Control: ${(payload[6] & 0x30) >> 4}\n`;
-		    headerMsg += `                Priority: ${(payload[6] & 0x08) >> 3}\n`;
-		    headerMsg += `                Data Alignment: ${(payload[6] & 0x04) >> 2}\n`;
-		    headerMsg += `                Copyright: ${(payload[6] & 0x02) >> 1}\n`;
-		    headerMsg += `                Original/Copy: ${payload[6] & 0x01}\n`;
-		    headerMsg += `                PTS_DTS_flags: ${(payload[7] & 0xC0) >> 6}\n`;
-		    headerMsg += `                ESCR flag: ${(payload[7] & 0x20) >> 5}\n`;
-		    headerMsg += `                ES Rate flag: ${(payload[7] & 0x10) >> 4}\n`;
-		    headerMsg += `                DSM Trick Mode: ${(payload[7] & 0x08) >> 3}\n`;
-		    headerMsg += `                Additional Copy Info: ${(payload[7] & 0x04) >> 2}\n`;
-		    headerMsg += `                PES CRC flag: ${(payload[7] & 0x02) >> 1}\n`;
-		    headerMsg += `                PES Extension: ${payload[7] & 0x01}\n`;
-		    headerMsg += `                PES Header Length: ${payload[8]}\n`;
-		    headerMsg += `                Raw PTS bytes: ${payload.slice(9, 14).map(b => b.toString(16).padStart(2, '0')).join(' ')}\n`;
-		    headerMsg += `                PTS byte details:\n`;
-		    headerMsg += `                    Byte 1 (0x${payload[9].toString(16).padStart(2, '0')}): ${payload[9].toString(2).padStart(8, '0')}\n`;
-		    headerMsg += `                    Byte 2 (0x${payload[10].toString(16).padStart(2, '0')}): ${payload[10].toString(2).padStart(8, '0')}\n`;
-		    headerMsg += `                    Byte 3 (0x${payload[11].toString(16).padStart(2, '0')}): ${payload[11].toString(2).padStart(8, '0')}\n`;
-		    headerMsg += `                    Byte 4 (0x${payload[12].toString(16).padStart(2, '0')}): ${payload[12].toString(2).padStart(8, '0')}\n`;
-		    headerMsg += `                    Byte 5 (0x${payload[13].toString(16).padStart(2, '0')}): ${payload[13].toString(2).padStart(8, '0')}\n`;
-		    //this.onLog(headerMsg);
-		}
-	    }
-	}
-
-	_extractPTS(payload) {
-	    // Log detailed stats and PES header info (conditional)
-	    //this.logDetailedStatsConditional(Date.now(), payload);
-
-	    // Ensure there is enough data and a valid PES start
-	    if (payload.length < 14) {
-		this.debugStats.noPTS++;
-		return null;
-	    }
-	    
-	    if (payload[0] !== 0x00 || payload[1] !== 0x00 || payload[2] !== 0x01) {
-		this.debugStats.notPESHeader++;
-		return null;
-	    }
-	    
-	    // Check for video stream ID - could be 0xE0-0xEF for video
-	    if (payload[3] < 0xE0 || payload[3] > 0xEF) {
-		this.debugStats.notPESHeader++;
-		return null;
-	    }
-	    
-	    const ptsDtsFlags = (payload[7] & 0xC0) >> 6;
-	    if (ptsDtsFlags === 0) {
-		this.debugStats.noPTS++;
-		return null;
-	    }
-
-	    // The five PTS bytes are located at indexes 9 to 13.
-	    const p0 = payload[9];   // e.g. 0x21
-	    const p1 = payload[10];  // e.g. 0x00
-	    const p2 = payload[11];  // e.g. 0x03
-	    const p3 = payload[12];  // e.g. 0x35
-	    const p4 = payload[13];  // e.g. 0x61
-
-	    // Log raw PTS bytes for debugging
-	    const hexBytes = [p0, p1, p2, p3, p4].map(b => b.toString(16).padStart(2, '0')).join(' ');
-	    //this.onLog(`[DEBUG] Raw PTS bytes: ${hexBytes}`);
-	    
-	    // Extract the 33-bit PTS, handling marker bits correctly
-	    const pts =
-		(((p0 >> 1) & 0x07) << 30) | // Bits 32-30
-		(p1 << 22) |                 // Bits 29-22
-		(((p2 >> 1) & 0x7F) << 15) | // Bits 21-15
-		(p3 << 7) |                  // Bits 14-7
-		((p4 >> 1) & 0x7F);          // Bits 6-0
-
-	    // Log the computed PTS value
-	    //this.onLog(`[INFO] Extracted PTS: ${pts} from bytes: ${hexBytes}`);
-	    
-	    // Update statistics
-	    this.debugStats.validPTS++;
-	    this.lastValidPTS = pts;
-	    
-	    this.debugStats.pts.push(pts);
-	    if (this.debugStats.pts.length > 5) {
-		this.debugStats.pts.shift();
-	    }
-
-	    return pts;
-	}
+        // The five PTS bytes are located at indexes 9 to 13.
+        const p0 = payload[9];
+        const p1 = payload[10];
+        const p2 = payload[11];
+        const p3 = payload[12];
+        const p4 = payload[13];
+        
+        // Extract the 33-bit PTS, handling marker bits correctly
+        const pts =
+            (((p0 >> 1) & 0x07) << 30) | // Bits 32-30
+            (p1 << 22) |                 // Bits 29-22
+            (((p2 >> 1) & 0x7F) << 15) | // Bits 21-15
+            (p3 << 7) |                  // Bits 14-7
+            ((p4 >> 1) & 0x7F);          // Bits 6-0
+        
+        return pts;
+    }
 
     _handleWraparound(pts) {
         if (this.lastValidPTS !== null && pts < this.lastValidPTS) {
             const ptsDrop = this.lastValidPTS - pts;
             if (ptsDrop > 4294967296) {
                 this.wraparoundOffset += 8589934592;
-                //this.onLog(`PTS wraparound detected! New offset: ${this.wraparoundOffset}`);
             }
             pts += this.wraparoundOffset;
         }
         return pts;
     }
-
-    _logDetailedStats(timeReceived) {
-        const pts = this.lastValidPTS !== null ? 
-                   this.lastValidPTS : 
-                   (this.packetCount * this.estimatedFrameDuration);
-
-	    /*
-        this.onLog(`Packet Stats #${this.packetCount}:
-            PTS: ${pts}
-            Received at: ${timeReceived}
-            Total Packets: ${this.debugStats.totalPackets}
-            Video PID (256) Packets: ${this.debugStats.videoPIDPackets}
-            PES Packet Starts: ${this.debugStats.pesStarts}
-            Valid PTS Found: ${this.debugStats.validPTS}
-            Not PES Header: ${this.debugStats.notPESHeader}
-            No PTS: ${this.debugStats.noPTS}
-            Last 5 PTS values: ${this.debugStats.pts.join(', ')}`);
-	    */
-    }
 }
 
+/**
+ * Main WebTransportLoader class - handles WebTransport streams with rotation support
+ */
 class WebTransportLoader extends BaseLoader {
-    constructor() {
+    constructor(config = {}) {
         super('webtransport-loader');
         this.TAG = 'WebTransportLoader';
 
+        // Basic loader properties
         this._needStash = true;
         this._transport = null;
-        this._reader = null;
         this._requestAbort = false;
         this._receivedLength = 0;
-	this.debugCounter = 0;
+        this.debugCounter = 0;
 
-        // Initialize with bound logging function
-        const logFunction = (msg) => Log.v(this.TAG, msg);
+        // Configure settings
+        this.config = {
+            enableStreamRotationHandler: config.enableStreamRotationHandler !== false,
+            minBufferTime: config.minBufferTime || 1000,     // Min time to buffer before output
+            maxBufferTime: config.maxBufferTime || 5000,     // Max time to buffer before forcing output
+            packetFlushThreshold: config.packetFlushThreshold || 100,  // Number of packets per chunk
+            maxConcurrentStreams: config.maxConcurrentStreams || 5,    // Max concurrent streams to handle
+            enableDetailedLogging: config.enableDetailedLogging || false
+        };
+
+// Initialize logging function
+        const logFunction = (msg) => this.config.enableDetailedLogging ? Log.v(this.TAG, msg) : null;
+        
+        // Initialize components
         this.tsBuffer = new MPEGTSBuffer(logFunction);
         this.packetLogger = new PacketLogger(logFunction);
+        this.packetValidator = new TSPacketValidator({ onLog: logFunction });
+        
+        // Initialize stream rotation handler
+        this.streamRotationHandler = new StreamRotationHandler({
+            onLog: logFunction,
+            maxBufferSize: 5 * 1024 * 1024,  // 5MB per stream
+            minBufferTime: this.config.minBufferTime,
+            maxBufferTime: this.config.maxBufferTime,
+            flushThreshold: this.config.packetFlushThreshold
+        });
 
-        // Bind methods
-        this._readChunks = this._readChunks.bind(this);
-        this._processPackets = this._processPackets.bind(this);
-	this.PACKETS_PER_CHUNK = 15;  
+        // Stream tracking
+        this._activeStreams = new Map();  // streamId -> {reader, startTime, status}
+        this._streamIdCounter = 0;
+        this._lastFlushTime = 0;
+        
+        // Output buffering
+        this.PACKETS_PER_CHUNK = this.config.packetFlushThreshold;
         this._packetBuffer = [];
-
-	this.testHarness = new MPEGTSTestHarness({
-	    onLog: (msg) => { Log.v(this.TAG, msg); }
-	});
+        this._outputBuffer = [];
+        
+        // Internal state
+        this._isInitialized = false;
+        
+        // Bind methods
+        this._monitorIncomingStreams = this._monitorIncomingStreams.bind(this);
+        this._processStreamData = this._processStreamData.bind(this);
+        this._flushOutputBuffer = this._flushOutputBuffer.bind(this);
     }
 
-    static isSupported() {
-        try {
-            return typeof self.WebTransport !== 'undefined';
-        } catch (e) {
-            return false;
-        }
-    }
+	static isSupported() {
+	    try {
+		if (typeof self.WebTransport === 'undefined') {
+		    return false;
+		}
+		
+		// Additional compatibility checks
+		const userAgent = navigator.userAgent;
+		if (userAgent.includes('Chrome/') || 
+		    userAgent.includes('Edge/') || 
+		    (userAgent.includes('Safari/') && !userAgent.includes('Chrome/'))) {
+		    // Check version through regex
+		    const versionMatch = /Chrome\/(\d+)|Version\/(\d+\.\d+)/.exec(userAgent);
+		    if (versionMatch) {
+			const version = versionMatch[1] || versionMatch[2];
+			return parseFloat(version) >= 87;
+		    }
+		}
+		
+		// For other browsers, just check if WebTransport exists
+		return true;
+	    } catch (e) {
+		return false;
+	    }
+	}
 
     destroy() {
         if (this._transport) {
             this.abort();
         }
+        
+        // Clean up all active streams
+        for (const [streamId, streamData] of this._activeStreams.entries()) {
+            if (streamData.reader) {
+                try {
+                    streamData.reader.cancel("Loader destroyed");
+                } catch (e) {
+                    // Ignore errors during cleanup
+                }
+            }
+        }
+        
+        this._activeStreams.clear();
+        this.streamRotationHandler = null;
+        this.tsBuffer = null;
+        this.packetLogger = null;
+        this.packetValidator = null;
+        
         super.destroy();
     }
 
-	_handleBufferUnderrun() {
-	    Log.w(this.TAG, "Buffer underrun detected, attempting to recover");
-	    
-	    // Request higher priority for the next few chunks
-	    this.priorityMode = true;
-	    
-	    // Reset any potentially corrupted state
-	    this.tsBuffer = new MPEGTSBuffer((msg) => Log.v(this.TAG, msg));
-	    this.packetLogger = new PacketLogger((msg) => Log.v(this.TAG, msg));
-	    
-	    // Notify controller to prepare for discontinuity
-	    if (this._onRecoveryNeeded) {
-		this._onRecoveryNeeded();
-	    }
-	}
+async open(dataSource) {
+    try {
+        if (!dataSource.url.startsWith('https://')) {
+            throw new Error('WebTransport requires HTTPS URL');
+        }
 
-	async validateTsChunkBeforeSending(chunk) {
-	    if (!chunk || chunk.byteLength === 0) {
-		Log.w(this.TAG, 'Empty chunk received, skipping validation');
-		return false;
-	    }
+        // Store URL for potential reconnection
+        this._lastUrl = dataSource.url;
+        this._startTime = Date.now();
+        
+        Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
 
-	    const view = new Uint8Array(chunk);
-	    const packetSize = 188;
-	    
-	    // 1. Check if chunk size is a multiple of 188 bytes
-	    if (view.byteLength % packetSize !== 0) {
-		Log.e(this.TAG, `Chunk size (${view.byteLength}) is not a multiple of ${packetSize}, possible fragmentation`);
-		this._logHexDump(view, 0, Math.min(48, view.byteLength), 'Invalid chunk start');
-		return false;
-	    }
-	    
-	    // 2. Check if each packet starts with sync byte 0x47
-	    let validPackets = 0;
-	    let invalidPackets = 0;
-	    let pidCounts = new Map();
-	    
-	    for (let i = 0; i < view.byteLength; i += packetSize) {
-		if (view[i] !== 0x47) {
-		    invalidPackets++;
-		    Log.e(this.TAG, `Invalid sync byte at offset ${i}: 0x${view[i].toString(16)}`);
-		    this._logHexDump(view, i, Math.min(16, view.byteLength - i), 'Bad sync');
-		    continue;
-		}
-		
-		// Extract PID info
-		const pid = ((view[i + 1] & 0x1F) << 8) | view[i + 2];
-		pidCounts.set(pid, (pidCounts.get(pid) || 0) + 1);
-		
-		// Check continuity counter
-		const cc = view[i + 3] & 0x0F;
-		const hasPayload = (view[i + 3] & 0x10) !== 0;
-		const hasAdaptation = (view[i + 3] & 0x20) !== 0;
-		
-		// Check for adaptation field length validity if present
-		if (hasAdaptation) {
-		    if (i + 4 >= view.byteLength) {
-			Log.e(this.TAG, `Truncated packet at offset ${i}, missing adaptation field length`);
-			continue;
-		    }
-		    
-		    const adaptationLength = view[i + 4];
-		    if (adaptationLength > 183) {
-			Log.e(this.TAG, `Invalid adaptation field length ${adaptationLength} at offset ${i}`);
-			continue;
-		    }
-		}
-		
-		validPackets++;
-	    }
-	    
-	    // 3. Log validation summary
-	    const isValid = invalidPackets === 0 && validPackets > 0;
-	    
-	    /*
-	    Log.i(this.TAG, `Chunk validation: ${isValid ? 'VALID' : 'INVALID'} - ` + 
-		  `${validPackets} valid, ${invalidPackets} invalid, ${view.byteLength} bytes total`);
-            */
-	    
-	    // Log PID distribution
-	    if (validPackets > 0) {
-		let pidInfo = 'PIDs detected: ';
-		for (const [pid, count] of pidCounts.entries()) {
-		    pidInfo += `0x${pid.toString(16).padStart(4, '0')}(${count}) `;
-		}
-		//Log.d(this.TAG, pidInfo);
-	    }
-	    
-	    return isValid;
-	}
+        // Create a new WebTransport instance - ONLY ONE INSTANCE
+        this._transport = new WebTransport(dataSource.url);
+        
+        // Set up error handler for connection
+        this._transport.closed.catch(error => {
+            Log.e(this.TAG, `WebTransport connection closed with error: ${error.message}`);
+            this._handleConnectionFailure();
+        });
+        
+        // Wait for connection to be ready
+        await this._transport.ready;
+        
+        Log.v(this.TAG, "WebTransport connection established successfully");
+        this._status = LoaderStatus.kBuffering;
 
-	_logHexDump(data, offset, length, label) {
-	    const end = Math.min(offset + length, data.length);
-	    const bytes = [];
-	    const ascii = [];
-	    
-	    for (let i = offset; i < end; i++) {
-		const byte = data[i];
-		bytes.push(byte.toString(16).padStart(2, '0'));
-		// Add printable ASCII characters or a dot for non-printable
-		ascii.push(byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.');
-	    }
-	    
-	    //Log.d(this.TAG, `${label || 'Hex dump'} [${offset}-${end-1}]: ${bytes.join(' ')} | ${ascii.join('')}`);
-	}
-
-	_attemptToFixAlignment(chunk) {
-	    const view = new Uint8Array(chunk);
-	    
-	    // Find first sync byte
-	    let firstSyncIndex = -1;
-	    for (let i = 0; i < Math.min(view.byteLength, 500); i++) {
-		if (view[i] === 0x47) {
-		    // Check if we have multiple sync bytes at the expected interval
-		    let validSyncCount = 1;
-		    for (let j = 1; j <= 3; j++) {
-			const nextSyncPos = i + (j * 188);
-			if (nextSyncPos < view.byteLength && view[nextSyncPos] === 0x47) {
-			    validSyncCount++;
-			} else {
-			    break;
-			}
-		    }
-		    
-		    if (validSyncCount >= 2) {
-			firstSyncIndex = i;
-			break;
-		    }
-		}
-	    }
-	    
-	    if (firstSyncIndex === -1) {
-		Log.e(this.TAG, 'Could not find valid sync pattern in chunk');
-		return null;
-	    }
-	    
-	    if (firstSyncIndex === 0) {
-		// Alignment is correct
-		return chunk;
-	    }
-	    
-	    // Fix alignment by trimming
-	    Log.w(this.TAG, `Fixing alignment by trimming ${firstSyncIndex} bytes from start`);
-	    return view.slice(firstSyncIndex).buffer;
-	}
-
-
-	async diagnoseStream() {
-	    try {
-		//Log.v(this.TAG, "Starting stream diagnosis...");
-		
-		// 1. Check if WebTransport is properly supported
-		if (!WebTransportLoader.isSupported()) {
-		    Log.e(this.TAG, "WebTransport is not supported in this browser");
-		    return false;
-		}
-		
-		// 2. Compare with a known working stream (if available)
-		//Log.v(this.TAG, "Suggestion: Try a known working MPEG-TS stream for comparison");
-		
-		// 3. Check if we're receiving any data
-		if (this._receivedLength === 0) {
-		    Log.e(this.TAG, "No data received from the WebTransport stream");
-		    return false;
-		}
-		
-		// 4. Check if we've found valid TS packets
-		if (this.tsBuffer.stats.validPackets === 0) {
-		    //Log.e(this.TAG, "No valid TS packets found in the received data");
-		    //Log.v(this.TAG, "This could indicate a non-MPEG-TS stream or corrupted data");
-		    return false;
-		}
-		
-		// 5. Report on PIDs found
-		//Log.v(this.TAG, "PIDs found in the stream:");
-		for (const [pid, count] of this.tsBuffer.stats.pidDistribution.entries()) {
-		    //Log.v(this.TAG, `  PID 0x${pid.toString(16).padStart(4, '0')}: ${count} packets`);
-		}
-		
-		// 6. Check for expected PIDs
-		// Common PIDs: 0x00 (PAT), 0x01 (CAT), 0x1000+ (PMT), 0x1100+ (Video), 0x1200+ (Audio)
-		const hasPAT = this.tsBuffer.stats.pidDistribution.has(0);
-		const hasVideo = Array.from(this.tsBuffer.stats.pidDistribution.keys())
-		    .some(pid => (pid >= 0x1100 && pid <= 0x11FF) || pid === 0x0041 || pid === 0x0042);
-		
-		if (!hasPAT) {
-		    Log.w(this.TAG, "No Program Association Table (PAT) found - stream may be invalid");
-		}
-		
-		if (!hasVideo) {
-		    Log.w(this.TAG, "No common video PIDs found - stream may not contain video");
-		}
-		
-		// 7. Check PTS values
-		if (this.packetLogger.debugStats.validPTS === 0) {
-		    Log.e(this.TAG, "No valid PTS values found - playback might not be possible");
-		    return false;
-		}
-		
-		//Log.v(this.TAG, "Stream diagnosis complete - found valid data with PTS values");
-		return true;
-	    } catch (e) {
-		Log.e(this.TAG, `Error during diagnosis: ${e.message}`);
-		return false;
-	    }
-	}
-
-    async open(dataSource) {
-	this.diagnoseStream().then(valid => {
-	    if (!valid) {
-		Log.w(this.TAG, "Stream diagnosis indicates potential issues");
-	    }
-	});
-	this.testHarness.reset();
+        // Get incoming streams
+        const incomingStreams = this._transport.incomingUnidirectionalStreams;
+        const streamReader = incomingStreams.getReader();
+        
+        // Read the first stream
+        const { value: stream, done } = await streamReader.read();
+        
+        if (done || !stream) {
+            throw new Error('No incoming stream received');
+        }
+        
+        // Set up our reader with the first stream
+        this._reader = stream.getReader();
+        
+        // Set up test harness
+        this.testHarness.reset();
         this.testHarness.integrateWithLoader(this);
-        try {
-            if (!dataSource.url.startsWith('https://')) {
-                throw new Error('WebTransport requires HTTPS URL');
-            }
-
-            Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
-
-            this._transport = new WebTransport(dataSource.url);
-            await this._transport.ready;
-
-            const incomingStreams = this._transport.incomingUnidirectionalStreams;
-            const streamReader = incomingStreams.getReader();
-            const { value: stream } = await streamReader.read();
-
-            if (!stream) {
-                throw new Error('No incoming stream received');
-            }
-
-            this._reader = stream.getReader();
-            this._status = LoaderStatus.kBuffering;
-
-            this._readChunks();
-
-	    this._transport = new WebTransport(dataSource.url);
-	    await this._transport.ready;
-		
-	    // Start a continuous process to monitor for new streams
-	    this._monitorIncomingStreams();
-
-            this.diagnosticTimer = setInterval(() => {
-               this.advancedStreamDiagnosis();
-            }, 10000); // Run diagnosis every 10 seconds
-
-        } catch (e) {
-            this._status = LoaderStatus.kError;
-            if (this._onError) {
-                this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
-            }
+        
+        // Start reading data from the first stream
+        this._readChunks();
+        
+        // Start monitoring for additional streams
+        this._monitorIncomingStreams(streamReader);
+        
+        // Set up diagnostic timer
+        this.diagnosticTimer = setInterval(() => {
+            this.advancedStreamDiagnosis();
+        }, 10000);
+        
+    } catch (e) {
+        Log.e(this.TAG, `Error opening WebTransport connection: ${e.message}`);
+        this._status = LoaderStatus.kError;
+        if (this._onError) {
+            this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
         }
     }
+}
 
-	async _processStreamData(stream, streamId) {
-	    const reader = stream.getReader();
-	    
-	    // Update active stream ID
-	    const previousStreamId = this._activeStreamId;
-	    this._activeStreamId = streamId;
-	    
-	    // If we're switching streams, prepare for potential discontinuity
-	    if (previousStreamId !== null && previousStreamId !== streamId) {
-		Log.v(this.TAG, `Switching from stream ${previousStreamId} to ${streamId}, preparing for discontinuity`);
-		
-		// Signal discontinuity to your MSE controller
-		// This might involve calling a method like:
-		if (this._onStreamDiscontinuity) {
-		    this._onStreamDiscontinuity();
-		}
+    /**
+     * Monitor for incoming unidirectional streams from the server
+     */
+	async _monitorIncomingStreams(streamReader) {
+	    if (!this._transport || this._transport.closed) {
+		Log.e(this.TAG, "Cannot monitor streams: transport is closed or null");
+		return;
 	    }
-	    try {
-		let pendingData = new Uint8Array(0);
-		
-		while (true) {
-		    const { value, done } = await reader.read();
-		    
-		    if (done) {
-			Log.v(this.TAG, `Stream ${streamId} ended`);
-			// Process any remaining data
-			// ...
-			break;
-		    }
-		    
-		    if (value) {
-			// Process chunk as in your existing _readChunks method
-			// ...
-		    }
-		}
-	    } catch (e) {
-		Log.e(this.TAG, `Error reading stream ${streamId}: ${e.message}`);
-	    }
-	}
-
-	async _monitorIncomingStreams() {
-	    const incomingStreams = this._transport.incomingUnidirectionalStreams;
-	    const streamReader = incomingStreams.getReader();
+	    
+	    // We already have the streamReader as a parameter
+	    // This should be the reader for incomingUnidirectionalStreams
 	    
 	    try {
-		while (true) {
-		    const { value: stream, done } = await streamReader.read();
-		    
-		    if (done) {
-			Log.v(this.TAG, "No more incoming streams available");
-			break;
-		    }
-		    
-		    if (!stream) {
-			Log.w(this.TAG, "Received null stream, continuing");
-			continue;
-		    }
-		    
-		    Log.v(this.TAG, "New stream detected, starting reader");
-		    
-		    // Each stream gets its own reader
-		    const streamId = crypto.randomUUID(); // Generate unique ID
-		    this._processStreamData(stream, streamId);
-		}
-	    } catch (e) {
-		Log.e(this.TAG, `Error monitoring streams: ${e.message}`);
-	    }
-	}
-
-	async advancedStreamDiagnosis() {
-	    // Create a diagnostic report
-	    Log.v(this.TAG, "========= MPEG-TS STREAM DIAGNOSTIC REPORT =========");
-	    
-	    // 1. WebTransport connection status
-	    Log.v(this.TAG, `WebTransport connection: ${this._transport && !this._transport.closed ? 'ACTIVE' : 'INACTIVE'}`);
-	    
-	    // 2. Received data statistics
-	    Log.v(this.TAG, `Total bytes received: ${this._receivedLength}`);
-	    
-	    // 3. Buffer statistics
-	    if (this.tsBuffer) {
-		Log.v(this.TAG, `TS Buffer statistics:`);
-		Log.v(this.TAG, `  Total packets processed: ${this.tsBuffer.stats.totalPacketsProcessed}`);
-		Log.v(this.TAG, `  Valid packets: ${this.tsBuffer.stats.validPackets}`);
-		Log.v(this.TAG, `  Invalid packets: ${this.tsBuffer.stats.invalidPackets}`);
-		Log.v(this.TAG, `  Invalid sync bytes: ${this.tsBuffer.stats.invalidSyncByteCount}`);
+		Log.v(this.TAG, "Monitoring for additional incoming streams");
 		
-		// 4. Detailed PID statistics
-		//Log.v(this.TAG, "PID distribution:");
-		if (this.tsBuffer.stats.pidDistribution.size === 0) {
-		    Log.v(this.TAG, "  No PIDs detected");
-		} else {
-		    for (const [pid, count] of this.tsBuffer.stats.pidDistribution.entries()) {
-			const pidHex = pid.toString(16).padStart(4, '0');
-			Log.v(this.TAG, `  PID 0x${pidHex}: ${count} packets (${(count / this.tsBuffer.stats.validPackets * 100).toFixed(1)}%)`);
-			
-			// Add common PID interpretations
-			if (pid === 0x0000) {
-			    Log.v(this.TAG, "    - This is the Program Association Table (PAT)");
-			} else if (pid === 0x0001) {
-			    Log.v(this.TAG, "    - This is the Conditional Access Table (CAT)");
-			} else if (pid === 0x1FFF) {
-			    Log.v(this.TAG, "    - This is a Null packet");
-			} else if (pid >= 0x0002 && pid <= 0x000F) {
-			    Log.v(this.TAG, "    - Reserved PID");
-			} else if (pid === 0x0100 || pid === 0x1000) {
-			    Log.v(this.TAG, "    - Likely Program Map Table (PMT)");
-			} else if (pid === 0x0101 || pid === 0x1001) {
-			    Log.v(this.TAG, "    - Likely Network Information Table (NIT)");
-			} else if (pid >= 0x0100 && pid <= 0x01FF) {
-			    Log.v(this.TAG, "    - Likely PMT or other SI/PSI table");
-			} else if (pid === 0x0040 || pid === 0x0041 || pid === 0x0042) {
-			    Log.v(this.TAG, "    - Standard DVB video PID");
-			} else if (pid === 0x0043 || pid === 0x0044 || pid === 0x0045) {
-			    Log.v(this.TAG, "    - Standard DVB audio PID");
-			} else if ((pid >= 0x1100 && pid <= 0x11FF) || pid === 0x00E0) {
-			    Log.v(this.TAG, "    - Likely video elementary stream");
-			} else if ((pid >= 0x1200 && pid <= 0x12FF) || (pid >= 0x00C0 && pid <= 0x00DF)) {
-			    Log.v(this.TAG, "    - Likely audio elementary stream");
-			}
-		    }
-		}
-	    }
-	    
-	    // 5. PTS statistics
-	    if (this.packetLogger) {
-		Log.v(this.TAG, "PTS/timing statistics:");
-		Log.v(this.TAG, `  Video packets: ${this.packetLogger.debugStats.videoPIDPackets}`);
-		Log.v(this.TAG, `  PES packet starts: ${this.packetLogger.debugStats.pesStarts}`);
-		Log.v(this.TAG, `  Valid PTS found: ${this.packetLogger.debugStats.validPTS}`);
+		let streamCounter = 1; // First stream is already being processed
 		
-		if (this.packetLogger.debugStats.pts.length > 0) {
-		    const ptsValues = this.packetLogger.debugStats.pts;
-		    Log.v(this.TAG, `  Last PTS values: ${ptsValues.join(', ')}`);
-		    
-		    // Check for PTS discontinuities
-		    let discontinuities = 0;
-		    for (let i = 1; i < ptsValues.length; i++) {
-			const diff = ptsValues[i] - ptsValues[i-1];
-			if (diff < 0 || diff > 90000) { // More than 1 second gap
-			    discontinuities++;
-			}
-		    }
-		    
-		    if (discontinuities > 0) {
-			Log.v(this.TAG, `  WARNING: ${discontinuities} PTS discontinuities detected`);
-		    }
-		}
-	    }
-	    
-	    // 6. Attempt to extract and validate program information
-	    this._extractProgramInfo();
-	    
-	    // 7. Detect common MPEG-TS problems
-	    this._detectCommonProblems();
-	    
-	    Log.v(this.TAG, "==================================================");
-	}
-
-	// Extract and validate program information from the stream
-	_extractProgramInfo() {
-	    if (!this.tsBuffer || this.tsBuffer.stats.validPackets === 0) {
-		Log.v(this.TAG, "Program information cannot be extracted: No valid packets received");
-		return;
-	    }
-	    
-	    Log.v(this.TAG, "Program information analysis:");
-	    
-	    // Check if we've seen a PAT
-	    const hasPAT = this.tsBuffer.stats.pidDistribution.has(0x0000);
-	    if (!hasPAT) {
-		Log.v(this.TAG, "  WARNING: No Program Association Table (PAT) detected!");
-		Log.v(this.TAG, "  - This is critical for proper demuxing");
-		return;
-	    }
-	    
-	    // Check for likely PMT PIDs
-	    let foundPMT = false;
-	    for (const pid of this.tsBuffer.stats.pidDistribution.keys()) {
-		// Common PMT PIDs or those referenced in your logs
-		if (pid === 0x1000 || pid === 0x0100 || pid === 0x1001 || pid === 0x4096) {
-		    Log.v(this.TAG, `  Found potential PMT at PID 0x${pid.toString(16)}`);
-		    foundPMT = true;
-		}
-	    }
-	    
-	    if (!foundPMT) {
-		Log.v(this.TAG, "  WARNING: No Program Map Table (PMT) detected!");
-		Log.v(this.TAG, "  - PMT is required to identify audio/video streams");
-	    }
-	    
-	    // Look for video elementary streams
-	    let foundVideo = false;
-	    for (const pid of this.tsBuffer.stats.pidDistribution.keys()) {
-		// Common video PIDs from your code or those in standard ranges
-		if (pid === 0x0100 || pid === 0x0041 || pid === 0x00E0 || 
-		    pid === 256 || pid === 0x0042 || 
-		    (pid >= 0x1100 && pid <= 0x11FF)) {
-		    Log.v(this.TAG, `  Found potential video stream at PID 0x${pid.toString(16)}`);
-		    foundVideo = true;
-		}
-	    }
-	    
-	    if (!foundVideo) {
-		Log.v(this.TAG, "  WARNING: No video elementary streams detected!");
-	    }
-	    
-	    // Look for audio elementary streams
-	    let foundAudio = false;
-	    for (const pid of this.tsBuffer.stats.pidDistribution.keys()) {
-		// Common audio PIDs or those in standard ranges
-		if (pid === 0x0043 || pid === 0x0044 || pid === 257 ||
-		    (pid >= 0x1200 && pid <= 0x12FF) || 
-		    (pid >= 0x00C0 && pid <= 0x00DF)) {
-		    Log.v(this.TAG, `  Found potential audio stream at PID 0x${pid.toString(16)}`);
-		    foundAudio = true;
-		}
-	    }
-	    
-	    if (!foundAudio) {
-		Log.v(this.TAG, "  WARNING: No audio elementary streams detected!");
-	    }
-	    
-	    // Check based on your error logs' specific PIDs
-	    if (this.tsBuffer.stats.pidDistribution.has(256) && 
-		this.tsBuffer.stats.pidDistribution.has(257)) {
-		Log.v(this.TAG, "  Found PIDs matching your logs: 256 (video h264) and 257 (audio aac)");
-	    }
-	}
-
-	// Detect common MPEG-TS problems based on gathered statistics
-	_detectCommonProblems() {
-	    Log.v(this.TAG, "Common MPEG-TS problem detection:");
-	    
-	    let problems = 0;
-	    
-	    // 1. Check for sync byte issues
-	    if (this.tsBuffer && this.tsBuffer.stats.invalidSyncByteCount > 0) {
-		const badSyncPercentage = (this.tsBuffer.stats.invalidSyncByteCount / 
-					 (this.tsBuffer.stats.totalPacketsProcessed || 1) * 100).toFixed(2);
-		
-		Log.v(this.TAG, `  PROBLEM: ${this.tsBuffer.stats.invalidSyncByteCount} packets with invalid sync bytes (${badSyncPercentage}%)`);
-		Log.v(this.TAG, "  - This indicates corruption in the transport stream");
-		Log.v(this.TAG, "  - Check for network issues or packet loss in WebTransport");
-		problems++;
-	    }
-	    
-	    // 2. Check for packet size issues
-	    if (this._receivedLength % 188 !== 0) {
-		Log.v(this.TAG, `  PROBLEM: Total received bytes (${this._receivedLength}) is not a multiple of 188`);
-		Log.v(this.TAG, "  - This suggests packets are being fragmented or not properly aligned");
-		Log.v(this.TAG, "  - Ensure packets are aligned to 188-byte boundaries before sending to demuxer");
-		problems++;
-	    }
-	    
-	    // 3. Check for missing PAT/PMT
-	    if (!this.tsBuffer || !this.tsBuffer.stats.pidDistribution.has(0x0000)) {
-		Log.v(this.TAG, "  PROBLEM: Missing Program Association Table (PAT)");
-		Log.v(this.TAG, "  - This is crucial for the player to understand the stream structure");
-		Log.v(this.TAG, "  - Check if your stream source provides valid PAT");
-		problems++;
-	    }
-	    
-	    // 4. Check PES packets vs. PTS findings
-	    if (this.packetLogger && 
-		this.packetLogger.debugStats.pesStarts > 0 && 
-		this.packetLogger.debugStats.validPTS === 0) {
-		
-		Log.v(this.TAG, "  PROBLEM: Found PES packet starts but no valid PTS values");
-		Log.v(this.TAG, "  - This suggests malformed PES headers or timing information");
-		Log.v(this.TAG, "  - Check PES header format and PTS extraction logic");
-		problems++;
-	    }
-	    
-	    // 5. Check for missing video or audio PIDs based on error logs
-	    if (this.tsBuffer && 
-		!this.tsBuffer.stats.pidDistribution.has(256) && 
-		!this.tsBuffer.stats.pidDistribution.has(0x0100)) {
-		
-		Log.v(this.TAG, "  PROBLEM: Missing expected video PID (256/0x100)");
-		Log.v(this.TAG, "  - The player expects this PID based on your error logs");
-		Log.v(this.TAG, "  - Check if your stream uses a different PID for video");
-		problems++;
-	    }
-	    
-	    // 6. Check for mismatch between PMT and actual streams
-	    // This is a simplified check assuming common PIDs
-	    if (this.tsBuffer && 
-		this.tsBuffer.stats.pidDistribution.has(0x1000) && 
-		!this.tsBuffer.stats.pidDistribution.has(256) && 
-		!this.tsBuffer.stats.pidDistribution.has(257)) {
-		
-		Log.v(this.TAG, "  PROBLEM: PMT may be present but expected elementary streams are missing");
-		Log.v(this.TAG, "  - Check that PMT correctly references available elementary streams");
-		problems++;
-	    }
-	    
-	    // 7. Check for likely adaptation field issues
-	    if (this.tsBuffer && this.tsBuffer.stats.adaptationFieldCount === 0 && 
-		this.tsBuffer.stats.validPackets > 100) {
-		
-		Log.v(this.TAG, "  PROBLEM: No packets with adaptation fields found");
-		Log.v(this.TAG, "  - This is unusual for a normal MPEG-TS stream with video");
-		Log.v(this.TAG, "  - Could indicate non-standard encoding or stripped timing information");
-		problems++;
-	    }
-	    
-	    // 8. Check packet distribution to detect abnormalities
-	    if (this.tsBuffer && this.tsBuffer.stats.pidDistribution.size === 1) {
-		const pid = Array.from(this.tsBuffer.stats.pidDistribution.keys())[0];
-		Log.v(this.TAG, `  PROBLEM: Only one PID (0x${pid.toString(16)}) found in the stream`);
-		Log.v(this.TAG, "  - This is extremely unusual for a playable MPEG-TS stream");
-		Log.v(this.TAG, "  - Stream may be severely corrupted or not a valid MPEG-TS");
-		problems++;
-	    }
-	    
-	    // Summarize findings
-	    if (problems === 0) {
-		Log.v(this.TAG, "  No common MPEG-TS problems detected");
-	    } else {
-		Log.v(this.TAG, `  Total problems detected: ${problems}`);
-		Log.v(this.TAG, "  RECOMMENDATION: Enable detailed packet validation before sending to demuxer");
-	    }
-	}
-
-	collectSamplePackets(numPackets = 10) {
-	    if (!this._packetBuffer || this._packetBuffer.length === 0) {
-		Log.w(this.TAG, "No packets available to sample");
-		return null;
-	    }
-	    
-	    const samples = this._packetBuffer.slice(0, Math.min(numPackets, this._packetBuffer.length));
-	    
-	    Log.v(this.TAG, `Collected ${samples.length} sample packets for analysis`);
-	    
-	    // Create a detailed analysis of the sampled packets
-	    samples.forEach((packet, index) => {
-		if (!(packet instanceof Uint8Array) || packet.length !== 188) {
-		    Log.e(this.TAG, `Sample #${index}: INVALID PACKET (${packet ? packet.length : 'null'} bytes)`);
-		    return;
-		}
-		
-		// Basic packet info
-		const syncByte = packet[0];
-		const transportError = (packet[1] & 0x80) !== 0;
-		const payloadStart = (packet[1] & 0x40) !== 0;
-		const pid = ((packet[1] & 0x1F) << 8) | packet[2];
-		const hasAdaptation = (packet[3] & 0x20) !== 0;
-		const hasPayload = (packet[3] & 0x10) !== 0;
-		const continuityCounter = packet[3] & 0x0F;
-		
-		let info = `Sample #${index}: PID=0x${pid.toString(16).padStart(4, '0')} `;
-		info += `CC=${continuityCounter} `;
-		info += `Start=${payloadStart ? 'YES' : 'no'} `;
-		info += `Error=${transportError ? 'YES' : 'no'} `;
-		info += `Adapt=${hasAdaptation ? 'YES' : 'no'} `;
-		info += `Payload=${hasPayload ? 'YES' : 'no'}`;
-		
-		Log.v(this.TAG, info);
-		
-		// If this is a payload start, try to analyze the PES header
-		if (payloadStart && hasPayload) {
-		    this._analyzePESHeader(packet, hasAdaptation);
-		}
-		
-		// Log the first 16 bytes in hex for reference
-		this._logHexDump(packet, 0, Math.min(16, packet.length), `Sample #${index} header`);
-	    });
-	    
-	    return samples;
-	}
-
-	// Helper to analyze PES headers in packets
-	_analyzePESHeader(packet, hasAdaptation) {
-	    const payloadOffset = hasAdaptation ? 5 + packet[4] : 4;
-	    
-	    if (packet.length < payloadOffset + 9) {
-		Log.v(this.TAG, "  PES: Packet too short for PES header");
-		return;
-	    }
-	    
-	    // Check for PES start code
-	    if (packet[payloadOffset] !== 0x00 || 
-		packet[payloadOffset + 1] !== 0x00 || 
-		packet[payloadOffset + 2] !== 0x01) {
-		
-		Log.v(this.TAG, "  PES: Invalid start code");
-		return;
-	    }
-	    
-	    const streamId = packet[payloadOffset + 3];
-	    const pesLength = (packet[payloadOffset + 4] << 8) | packet[payloadOffset + 5];
-	    
-	    let streamType = "Unknown";
-	    if (streamId >= 0xE0 && streamId <= 0xEF) {
-		streamType = "Video";
-	    } else if (streamId >= 0xC0 && streamId <= 0xDF) {
-		streamType = "Audio";
-	    } else if (streamId === 0xBC) {
-		streamType = "Program Stream Map";
-	    } else if (streamId === 0xBE) {
-		streamType = "Padding Stream";
-	    } else if (streamId === 0xBF) {
-		streamType = "Private Stream 2";
-	    }
-	    
-	    Log.v(this.TAG, `  PES: ${streamType} stream (ID=0x${streamId.toString(16)}), Length=${pesLength}`);
-	    
-	    // Check for PTS if we have enough data
-	    if (packet.length >= payloadOffset + 14) {
-		const ptsDtsFlags = (packet[payloadOffset + 7] & 0xC0) >> 6;
-		
-		if (ptsDtsFlags > 0) {
-		    // Extract and display PTS bytes
-		    const ptsBytes = Array.from(packet.slice(payloadOffset + 9, payloadOffset + 14))
-			.map(b => b.toString(16).padStart(2, '0'))
-			.join(' ');
-		    
-		    Log.v(this.TAG, `  PES: PTS/DTS flags=${ptsDtsFlags}, PTS bytes=${ptsBytes}`);
-		    
-		    // Try to calculate actual PTS value
+		while (!this._requestAbort) {
 		    try {
-			const p0 = packet[payloadOffset + 9];
-			const p1 = packet[payloadOffset + 10];
-			const p2 = packet[payloadOffset + 11];
-			const p3 = packet[payloadOffset + 12];
-			const p4 = packet[payloadOffset + 13];
-			
-			// Check if first bit marker is correct (should be '0010x' where x is a marker bit)
-			const prefix = (p0 >> 4) & 0x0F;
-			if ((prefix & 0x0E) !== 0x02) {
-			    Log.v(this.TAG, `  PES: Invalid PTS prefix (0x${prefix.toString(16)}), should be 0x2 or 0x3`);
-			}
-			
-			// Extract the 33-bit PTS
-			const pts = (((p0 >> 1) & 0x07) << 30) | 
-				   (p1 << 22) | 
-				   (((p2 >> 1) & 0x7F) << 15) | 
-				   (p3 << 7) | 
-				   ((p4 >> 1) & 0x7F);
-			
-			Log.v(this.TAG, `  PES: Calculated PTS=${pts} (${(pts/90000).toFixed(3)} seconds)`);
-		    } catch (e) {
-			Log.v(this.TAG, `  PES: Error calculating PTS: ${e.message}`);
-		    }
-		} else {
-		    Log.v(this.TAG, "  PES: No PTS/DTS flags set");
-		}
-	    }
-	}
-
-    getStreamQualityReport() {
-        return this.testHarness.generateReport();
-    }
-
-    getStreamHealthReport() {
-	    return {
-		testHarnessReport: this.testHarness.generateReport(),
-		receivedBytes: this._receivedLength,
-		packetStats: {
-		    total: this.tsBuffer.stats.totalPacketsProcessed,
-		    valid: this.tsBuffer.stats.validPackets,
-		    invalid: this.tsBuffer.stats.invalidPackets
-		},
-		ptsStats: {
-		    ptsFound: this.packetLogger.debugStats.validPTS,
-		    lastPTS: this.packetLogger.lastValidPTS
-		}
-	    };
-    }
-
-	async abort() {
-	    // First, clear any timers or intervals
-	    if (this.diagnosticTimer) {
-		clearInterval(this.diagnosticTimer);
-		this.diagnosticTimer = null;
-	    }
-	    
-	    // Signal abort request
-	    this._requestAbort = true;
-	    
-	    try {
-		// Cancel the reader first
-		if (this._reader) {
-		    await this._reader.cancel("Loader aborted").catch(e => {
-			Log.w(this.TAG, `Error canceling reader: ${e.message}`);
-		    });
-		    this._reader = null;
-		}
-		
-		// Close the transport with a clean reason
-		if (this._transport && !this._transport.closed) {
-		    Log.v(this.TAG, "Closing WebTransport connection...");
-		    await this._transport.close({closeCode: 0, reason: "Player destroyed"}).catch(e => {
-			Log.w(this.TAG, `Error closing transport: ${e.message}`);
-		    });
-		}
-	    } catch (e) {
-		Log.e(this.TAG, `Error during abort: ${e.message}`);
-	    } finally {
-		// Ensure nullification even if errors occur
-		this._transport = null;
-		this._packetBuffer = [];
-		this.tsBuffer = null;
-		this._status = LoaderStatus.kComplete;
-		
-		Log.v(this.TAG, "WebTransport connection cleanup complete");
-	    }
-	}
-
-	_processPackets(packets) {
-	    if (!packets || !Array.isArray(packets)) return;
-			    
-	    const now = Date.now();
-	    let validPackets = [];
-	    
-	    packets.forEach(packet => {
-		if (packet instanceof Uint8Array && packet.length === 188) {
-		    // Validate individual packet
-		    if (packet[0] !== 0x47) {
-			Log.e(this.TAG, 'Invalid sync byte in packet, skipping');
-			return; // Skip invalid packet
-		    }
-		    
-		    this._receivedLength += packet.length;
-		    this.packetLogger.logPacket(packet, now);
-		    validPackets.push(packet);
-		} else {
-		    Log.e(this.TAG, `Invalid packet format or length: ${packet ? packet.length : 'null'}`);
-		}
-	    });
-	    
-	    // Track error rate
-	    if (validPackets.length === 0 && packets.length > 0) {
-		this.consecutiveErrors = (this.consecutiveErrors || 0) + 1;
-		if (this.consecutiveErrors > 5) {
-		    Log.e(this.TAG, "Too many consecutive errors, attempting recovery");
-		    this._handleBufferUnderrun();
-		    this.consecutiveErrors = 0;
-		}
-	    } else if (validPackets.length > 0) {
-		this.consecutiveErrors = 0;
-	    }
-	    
-	    // Handle PTS continuity across streams
-	    if (this.packetLogger.lastValidPTS !== null) {
-		// Initialize PTS tracking if needed
-		if (this._lastGlobalPTS === undefined) {
-		    this._lastGlobalPTS = this.packetLogger.lastValidPTS;
-		    this._ptsOffset = 0;
-		} 
-		// Check for PTS wrapping backwards (could happen with stream switch)
-		else if (this.packetLogger.lastValidPTS < this._lastGlobalPTS &&
-			Math.abs(this.packetLogger.lastValidPTS - this._lastGlobalPTS) > 4500000) { // >50 sec diff suggests discontinuity
-		    
-		    // Calculate offset to maintain continuity
-		    const newOffset = this._ptsOffset + (this._lastGlobalPTS - this.packetLogger.lastValidPTS) + 90000; // +1 second gap
-		    Log.v(this.TAG, `PTS discontinuity detected: last=${this._lastGlobalPTS}, current=${this.packetLogger.lastValidPTS}, applying offset=${newOffset - this._ptsOffset}`);
-		    this._ptsOffset = newOffset;
-		}
-		
-		// Update global PTS tracking
-		this._lastGlobalPTS = this.packetLogger.lastValidPTS + this._ptsOffset;
-	    }
-	    
-	    // Only add valid packets to the buffer
-	    if (validPackets.length > 0) {
-		// Update the last packet time for heartbeat checking
-		this.lastPacketTime = Date.now();
-		
-		this._packetBuffer.push(...validPackets);
-		
-		// When we have enough packets, dispatch them as a chunk
-		if (this._packetBuffer.length >= this.PACKETS_PER_CHUNK) {
-		    this._dispatchPacketChunk();
-		}
-	    }
-	}
-
-	_dispatchPacketChunk() {
-	    if (this._packetBuffer.length === 0) return;
-	    
-	    // Combine packets into a single chunk
-	    const totalLength = this._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
-	    const chunk = new Uint8Array(totalLength);
-	    
-	    let offset = 0;
-	    this._packetBuffer.forEach(packet => {
-		chunk.set(packet, offset);
-		offset += packet.length;
-	    });
-
-	    // Calculate byte positions
-	    const byteStart = this._receivedLength - totalLength;
-
-	    // Track initialization state to avoid re-initializing on stream switches
-	    if (this._isInitialized === undefined) {
-		this._isInitialized = false;
-	    }
-
-	    // Validate the chunk before sending
-	    const isValid = this.validateTsChunkBeforeSending(chunk.buffer);
-	    
-	    if (!isValid) {
-		Log.e(this.TAG, `Invalid TS chunk detected, may cause demuxer errors. Attempting to fix...`);
-		// Try to fix alignment issues
-		const fixedChunk = this._attemptToFixAlignment(chunk.buffer);
-		if (fixedChunk) {
-		    // Add metadata about initialization state and PTS continuity
-		    const metadata = {
-			isInitialized: this._isInitialized,
-			ptsOffset: this._ptsOffset || 0,
-			isStreamSwitch: this._lastStreamSwitchTime && 
-				       (Date.now() - this._lastStreamSwitchTime < 2000) // 2sec window
-		    };
-		    
-		    this._onDataArrival(fixedChunk, byteStart, this._receivedLength, metadata);
-		    
-		    // After first chunk, mark as initialized for future reference
-		    if (!this._isInitialized) {
-			Log.v(this.TAG, "Media pipeline initialized, future stream switches will reuse this initialization");
-			this._isInitialized = true;
-		    }
-		} else {
-		    Log.e(this.TAG, `Could not fix chunk, skipping`);
-		}
-	    } else {
-		// Dispatch the valid chunk with initialization metadata
-		const metadata = {
-		    isInitialized: this._isInitialized,
-		    ptsOffset: this._ptsOffset || 0,
-		    isStreamSwitch: this._lastStreamSwitchTime && 
-				   (Date.now() - this._lastStreamSwitchTime < 2000) // 2sec window
-		};
-		
-		this._onDataArrival(chunk.buffer, byteStart, this._receivedLength, metadata);
-		
-		// After first chunk, mark as initialized for future reference
-		if (!this._isInitialized) {
-		    Log.v(this.TAG, "Media pipeline initialized, future stream switches will reuse this initialization");
-		    this._isInitialized = true;
-		}
-	    }
-
-	    // Clear the buffer
-	    this._packetBuffer = [];
-	}
-
-		_findAlignedSyncByte(buffer) {
-	    // Look for a pattern of sync bytes at 188-byte intervals
-	    for (let i = 0; i <= buffer.length - 188*2; i++) {
-		if (buffer[i] === 0x47) {
-		    // Check if we have multiple sync bytes at the expected interval
-		    let validSyncCount = 1;
-		    for (let j = 1; j <= 3; j++) {
-			const nextSyncPos = i + (j * 188);
-			if (nextSyncPos < buffer.length && buffer[nextSyncPos] === 0x47) {
-			    validSyncCount++;
-			} else {
-			    break;
-			}
-		    }
-
-		    // If we found at least 2 consecutive sync bytes at 188-byte intervals
-		    if (validSyncCount >= 2) {
-			return i;
-		    }
-		}
-	    }
-
-	    // Fallback: return the first sync byte we find
-	    for (let i = 0; i < buffer.length; i++) {
-		if (buffer[i] === 0x47) {
-		    return i;
-		}
-	    }
-
-	    return -1;
-	}
-
-	async _readChunks() {
-	    try {
-		let pendingData = new Uint8Array(0);
-		let debugCounter = 0;
-
-		while (true) {
-		    if (this._requestAbort) {
-			Log.v(this.TAG, "Read loop terminated due to abort request");
-			break;
-		    }
-		    
-		    try {
-			const { value, done } = await this._reader.read();
-			
-			// Check abort flag again after the async read operation
-			if (this._requestAbort) break;
+			const { value: stream, done } = await streamReader.read();
 			
 			if (done) {
-			    //Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
+			    Log.v(this.TAG, "No more incoming streams available");
+			    break;
+			}
+			
+			if (!stream) {
+			    Log.w(this.TAG, "Received null stream, continuing");
+			    continue;
+			}
+			
+			streamCounter++;
+			const streamId = `stream-${streamCounter}`;
+			Log.v(this.TAG, `New stream detected: ${streamId}, switching readers`);
+			
+			// Record the time of the stream switch for diagnostics
+			this._lastStreamSwitchTime = Date.now();
+			
+			// Wait for current read loop to complete if there is one
+			if (this._reader) {
+			    try {
+				// Signal that we're about to change readers
+				this._streamSwitchPending = true;
+				
+				// Give time for current read loop to finish
+				await new Promise(resolve => setTimeout(resolve, 50));
+				
+				// Cancel existing reader
+				await this._reader.cancel("Switching to new stream");
+			    } catch (e) {
+				// Ignore errors when canceling the reader
+			    }
+			}
+			
+			// Update reader to new stream
+			this._reader = stream.getReader();
+			
+			// Start reading from the new stream
+			this._readChunks();
+			
+			// Clear stream switch flag
+			this._streamSwitchPending = false;
+		    } catch (streamError) {
+			if (this._requestAbort) break;
+			
+			Log.e(this.TAG, `Error reading stream: ${streamError.message}`);
+			// Continue trying to read more streams despite errors
+			await new Promise(resolve => setTimeout(resolve, 500));
+		    }
+		}
+	    } catch (e) {
+		if (!this._requestAbort) {
+		    Log.e(this.TAG, `Error monitoring streams: ${e.message}`);
+		    if (this._onError) {
+			this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+		    }
+		}
+	    }
+	}
+
+
+	async _readChunks() {
+	    // If a read operation is already in progress, don't start another one
+	    if (this._readInProgress) {
+		return;
+	    }
+
+	    this._readInProgress = true;
+
+	    try {
+		let pendingData = new Uint8Array(0);
+
+		while (!this._requestAbort && !this._streamSwitchPending) {
+		    try {
+			// Check if reader is available
+			if (!this._reader) {
+			    Log.e(this.TAG, "Reader is null, cannot read chunks");
+			    break;
+			}
+
+			const { value, done } = await this._reader.read();
+
+			// Check abort flag again after the async read operation
+			if (this._requestAbort || this._streamSwitchPending) break;
+
+			if (done) {
+			    Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
 			    // Process any remaining valid data
 			    if (pendingData.length >= 188) {
 				const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
@@ -2065,9 +1125,9 @@ class WebTransportLoader extends BaseLoader {
 			}
 
 			if (value) {
+			    // Ensure we're working with Uint8Array
 			    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-			    debugCounter++;
-			    
+
 			    // Combine with any pending data from previous chunks
 			    if (pendingData.length > 0) {
 				const newBuffer = new Uint8Array(pendingData.length + chunk.length);
@@ -2076,69 +1136,449 @@ class WebTransportLoader extends BaseLoader {
 				chunk = newBuffer;
 				pendingData = new Uint8Array(0);
 			    }
-			    
+
 			    // Find and align to the first valid sync byte pattern
 			    const syncIndex = this._findAlignedSyncByte(chunk);
-			    
+
 			    if (syncIndex === -1) {
 				// No valid pattern found, store the chunk for next iteration
 				pendingData = chunk;
-				Log.w(this.TAG, `No valid sync pattern found in chunk (${chunk.length} bytes)`);
 				continue;
 			    } else if (syncIndex > 0) {
 				// Skip data before the first valid sync byte
 				chunk = chunk.slice(syncIndex);
-				Log.d(this.TAG, `Aligned to sync byte at offset ${syncIndex}`);
 			    }
-			    
+
 			    // Process only complete 188-byte packets
 			    const validLength = Math.floor(chunk.length / 188) * 188;
-			    
+
 			    if (validLength > 0) {
 				const validChunk = chunk.slice(0, validLength);
 				const packets = this.tsBuffer.addChunk(validChunk);
-				
+
 				if (packets) {
-				    //Log.v(this.TAG, `Processing ${packets.length} valid packets from ${validLength} bytes`);
 				    this._processPackets(packets);
-				} else {
-				    Log.w(this.TAG, `Failed to extract valid packets from ${validLength} bytes`);
 				}
 			    }
-			    
+
 			    // Store any remaining partial packet for the next chunk
 			    if (validLength < chunk.length) {
 				pendingData = chunk.slice(validLength);
-				//Log.d(this.TAG, `Storing ${pendingData.length} bytes for next chunk`);
 			    }
 			}
 		    } catch (readError) {
-			// If the error is due to abort, handle gracefully
-			if (this._requestAbort) {
-			    Log.v(this.TAG, "Read operation aborted as requested");
+			// If the error is due to abort or stream switch, handle gracefully
+			if (this._requestAbort || this._streamSwitchPending) {
 			    break;
 			}
-			// Otherwise re-throw for the outer catch to handle
-			throw readError;
+
+			// Check if the connection is closed
+			if (this._transport && this._transport.closed) {
+			    Log.e(this.TAG, "WebTransport connection is closed, cannot continue reading");
+			    break;
+			}
+
+			// Log the error but continue reading if possible
+			Log.e(this.TAG, `Error reading chunk: ${readError.message}`);
+
+			// Small delay before retry
+			await new Promise(resolve => setTimeout(resolve, 100));
 		    }
 		}
-		
+
 		// Flush any remaining packets if we're not aborting
 		if (this._packetBuffer.length > 0 && !this._requestAbort) {
 		    this._dispatchPacketChunk();
 		}
-		
+
 	    } catch (e) {
 		Log.e(this.TAG, `Error in _readChunks: ${e.message}`);
-		Log.e(this.TAG, e.stack);
-		this._status = LoaderStatus.kError;
-		if (this._onError) {
-		    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+		if (e.stack) {
+		    Log.e(this.TAG, e.stack);
+		}
+
+		if (!this._requestAbort) {
+		    this._status = LoaderStatus.kError;
+		    if (this._onError) {
+			this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+		    }
+		}
+	    } finally {
+		this._readInProgress = false;
+
+		// If we're switching streams, signal that we've finished
+		if (this._streamSwitchPending) {
+		    Log.v(this.TAG, "Read operation terminated due to stream switch");
 		}
 	    }
 	}
 
-}
+	    /**
+	     * Process data from a single stream
+	     * @param {string} streamId - The ID of the stream to process
+	     */
 
-export default WebTransportLoader;
+	// Note: This method is no longer needed and should be removed.
+	// The functionality has been merged into _readChunks and _monitorIncomingStreams
 
+	// If you need to keep it for compatibility with other code, here's a simplified version:
+
+	async _processStreamData(stream, streamId) {
+	    Log.v(this.TAG, `Processing stream ${streamId} - deprecated method`);
+
+	    // In the new implementation, we don't use this method anymore
+	    // Stream data is directly processed in _readChunks
+
+	    const reader = stream.getReader();
+
+	    try {
+		while (!this._requestAbort) {
+		    const { value, done } = await reader.read();
+
+		    if (done) {
+			Log.v(this.TAG, `Stream ${streamId} ended`);
+			break;
+		    }
+
+		    if (value) {
+			Log.v(this.TAG, `Received ${value.byteLength} bytes from stream ${streamId}`);
+			// We don't process the data here, just log it since this method is deprecated
+		    }
+		}
+	    } catch (e) {
+		Log.e(this.TAG, `Error reading stream ${streamId}: ${e.message}`);
+	    } finally {
+		try {
+		    reader.releaseLock();
+		} catch (e) {
+		    // Ignore errors during cleanup
+		}
+	    }
+
+	    Log.v(this.TAG, `Stream ${streamId} processing completed`);
+	}
+
+	    /**
+	     * Handle processed packets from the rotation handler
+	     * @param {Array} packets - Array of processed TS packets
+	     */
+	    _handleProcessedPackets(packets) {
+		if (!packets || packets.length === 0) {
+		    return;
+		}
+		
+		// Add packets to our output buffer
+		this._outputBuffer.push(...packets);
+		
+		// Check if we have enough packets to dispatch
+		if (this._outputBuffer.length >= this.PACKETS_PER_CHUNK) {
+		    this._flushOutputBuffer();
+		}
+	    }
+	    
+	    /**
+	     * Flush the output buffer and dispatch to the demuxer
+	     * @returns {boolean} - True if data was flushed, false otherwise
+	     */
+	    _flushOutputBuffer() {
+		if (this._outputBuffer.length === 0) {
+		    return false;
+		}
+		
+		const packetsToDispatch = this._outputBuffer.splice(0, 
+		    Math.min(this._outputBuffer.length, this.PACKETS_PER_CHUNK * 2));
+		
+		// Combine packets into a single chunk
+		const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
+		const chunk = new Uint8Array(totalLength);
+		
+		let offset = 0;
+		packetsToDispatch.forEach(packet => {
+		    chunk.set(packet, offset);
+		    offset += packet.length;
+		});
+		
+		// Log packets for diagnostics if enabled
+		if (this.config.enableDetailedLogging) {
+		    packetsToDispatch.forEach(packet => {
+			this.packetLogger.logPacket(packet, Date.now());
+		    });
+		}
+		
+		// Calculate byte positions for data arrival
+		const byteStart = this._receivedLength - totalLength;
+		
+		// Update the last flush time
+		this._lastFlushTime = Date.now();
+		
+		// Determine if we're in a stream transition
+		const inTransition = this.streamRotationHandler.isInTransition;
+		
+		// Create metadata about the chunk
+		const metadata = {
+		    isStreamTransition: inTransition,
+		    transitionSequence: this.streamRotationHandler.transitionSequenceCounter,
+		    ptsOffset: this.streamRotationHandler.globalPTSOffset,
+		    activeStreams: this._activeStreams.size,
+		    isInitialized: this._isInitialized === true
+		};
+		
+		// Mark as initialized after first chunk
+		if (!this._isInitialized) {
+		    this._isInitialized = true;
+		}
+		
+		// Send the data to the demuxer
+		if (this._onDataArrival) {
+		    this._onDataArrival(chunk.buffer, byteStart, this._receivedLength, metadata);
+		}
+		
+		return true;
+	    }
+	    
+	    /**
+	     * Check and flush buffers if needed based on time or size thresholds
+	     * @private
+	     */
+	    _checkAndFlushBuffers() {
+		// If no new data has been received recently, there's nothing to flush
+		if (this._outputBuffer.length === 0) {
+		    return;
+		}
+		
+		const now = Date.now();
+		const timeSinceLastFlush = now - (this._lastFlushTime || 0);
+		
+		// Force a flush if we have data and it's been too long since the last flush
+		// or if the buffer is getting too large
+		if ((timeSinceLastFlush > this.config.maxBufferTime) ||
+		    (this._outputBuffer.length >= this.PACKETS_PER_CHUNK * 2)) {
+		    Log.v(this.TAG, `Forcing buffer flush after ${timeSinceLastFlush}ms with ${this._outputBuffer.length} packets`);
+		    this._flushOutputBuffer();
+		}
+	    }
+	    
+	/**
+	 * Run diagnostics and health checks
+	 * @private
+	 */
+	_runDiagnostics() {
+	    if (this._requestAbort) return;
+
+	    try {
+		// Log general statistics
+		Log.v(this.TAG, "========= MPEG-TS STREAM DIAGNOSTIC REPORT =========");
+		
+		// WebTransport connection status
+		if (this._transport) {
+		    const state = this._transport.closed ? 'closed' : 'open';
+		    Log.v(this.TAG, `WebTransport State: ${state}`);
+		    Log.v(this.TAG, `WebTransport Ready Promise: ${this._transport.ready ? 'resolved' : 'pending'}`);
+		    Log.v(this.TAG, `WebTransport Closed: ${this._transport.closed ? 'YES' : 'no'}`);
+		    
+		    // Check if streams are being received
+		    Log.v(this.TAG, `Current Reader: ${this._reader ? 'active' : 'none'}`);
+		    Log.v(this.TAG, `Read In Progress: ${this._readInProgress ? 'YES' : 'no'}`);
+		    Log.v(this.TAG, `Stream Switch Pending: ${this._streamSwitchPending ? 'YES' : 'no'}`);
+		} else {
+		    Log.v(this.TAG, `WebTransport: null (connection not established)`);
+		}
+		
+		Log.v(this.TAG, `Last Stream Switch: ${this._lastStreamSwitchTime ? new Date(this._lastStreamSwitchTime).toISOString().substring(11, 19) : 'never'}`);
+		Log.v(this.TAG, `Total Bytes Received: ${this._receivedLength}`);
+		
+		// Buffer statistics
+		if (this.tsBuffer) {
+		    Log.v(this.TAG, `TS Buffer statistics:`);
+		    Log.v(this.TAG, `  Total packets processed: ${this.tsBuffer.stats.totalPacketsProcessed}`);
+		    Log.v(this.TAG, `  Valid packets: ${this.tsBuffer.stats.validPackets}`);
+		    Log.v(this.TAG, `  Invalid packets: ${this.tsBuffer.stats.invalidPackets}`);
+		    Log.v(this.TAG, `  Invalid sync bytes: ${this.tsBuffer.stats.invalidSyncByteCount}`);
+		}
+		
+		// PTS statistics
+		if (this.packetLogger) {
+		    Log.v(this.TAG, "PTS/timing statistics:");
+		    Log.v(this.TAG, `  Video packets: ${this.packetLogger.debugStats.videoPIDPackets}`);
+		    Log.v(this.TAG, `  PES packet starts: ${this.packetLogger.debugStats.pesStarts}`);
+		    Log.v(this.TAG, `  Valid PTS found: ${this.packetLogger.debugStats.validPTS}`);
+		    Log.v(this.TAG, `  Last PTS value: ${this.packetLogger.lastValidPTS}`);
+		    Log.v(this.TAG, `  Global PTS tracking: ${this._lastGlobalPTS || 'not initialized'}`);
+		    Log.v(this.TAG, `  PTS offset: ${this._ptsOffset || 0}`);
+		    
+		    // Check if we're getting PTS values
+		    if (this.packetLogger.debugStats.validPTS === 0 && this._receivedLength > 50000) {
+			Log.w(this.TAG, "WARNING: No valid PTS values found despite receiving data");
+		    }
+		}
+
+		// Output buffer status
+		Log.v(this.TAG, `Current packet buffer: ${this._packetBuffer.length} packets`);
+		
+		// Check for no data received
+		if (this._transport && !this._transport.closed && this._receivedLength === 0) {
+		    const elapsedSecs = (Date.now() - this._startTime) / 1000;
+		    if (elapsedSecs > 5) {
+			Log.w(this.TAG, `WARNING: No data received after ${elapsedSecs.toFixed(1)} seconds with open connection`);
+			
+			// If we've been waiting too long with no data, try refreshing the reader
+			if (elapsedSecs > 10 && !this._readInProgress && this._reader) {
+			    Log.v(this.TAG, "Attempting to restart reader due to no data");
+			    this._readChunks();
+			}
+		    }
+		}
+
+		Log.v(this.TAG, "====================================================");
+	    } catch (e) {
+		Log.e(this.TAG, `Error running diagnostics: ${e.message}`);
+	    }
+	}
+
+	/**
+	 * Check if the loader is in a stuck state and try to recover
+	 * @private
+	 */
+	_checkForStuckState() {
+	    const now = Date.now();
+	    
+	    // If we haven't received any data in 30 seconds but WebTransport appears open, we're stuck
+	    if (this._transport && 
+		!this._transport.closed && 
+		this._receivedLength === 0 && 
+		now - this._startTime > 30000) {
+		
+		Log.w(this.TAG, "Detected stuck state - no data received after 30 seconds");
+		
+		// Try to restart the connection
+		Log.v(this.TAG, "Attempting recovery by restarting transport connection");
+		
+		// Store the current URL for reconnection
+		const currentUrl = this._transport.url || this._lastUrl;
+		
+		// Close the current connection
+		this._transport.close().catch(() => {});
+		
+		// Clear all streams
+		this._activeStreams.clear();
+		
+		// Attempt reconnection after a short delay
+		setTimeout(() => {
+		    if (!this._requestAbort && currentUrl) {
+			Log.v(this.TAG, `Reconnecting to ${currentUrl}`);
+			this.open({ url: currentUrl });
+		    }
+		}, 2000);
+	    }
+	}
+
+	    /**
+	     * Abort and clean up the loader
+	     */
+
+	async abort() {
+	    // First, clear any timers or intervals
+	    if (this.diagnosticTimer) {
+		clearInterval(this.diagnosticTimer);
+		this.diagnosticTimer = null;
+	    }
+
+	    // Signal abort request to stop all operations
+	    this._requestAbort = true;
+
+	    try {
+		// Cancel current reader if it exists
+		if (this._reader) {
+		    try {
+			await this._reader.cancel("Loader aborted").catch(e => {
+			    Log.w(this.TAG, `Error canceling reader: ${e.message}`);
+			});
+			this._reader = null;
+		    } catch (e) {
+			// Ignore errors during cleanup
+			Log.w(this.TAG, `Error during reader cancel: ${e.message}`);
+		    }
+		}
+
+		// Ensure any pending data is processed
+		if (this._packetBuffer.length > 0) {
+		    try {
+			this._dispatchPacketChunk();
+		    } catch (e) {
+			Log.w(this.TAG, `Error dispatching final packet chunk: ${e.message}`);
+		    }
+		}
+
+		// Close the transport with a clean reason
+		if (this._transport && !this._transport.closed) {
+		    Log.v(this.TAG, "Closing WebTransport connection...");
+		    try {
+			await this._transport.close({
+			    closeCode: 0,
+			    reason: "Player destroyed"
+			}).catch(e => {
+			    Log.w(this.TAG, `Error closing transport: ${e.message}`);
+			});
+		    } catch (e) {
+			Log.w(this.TAG, `Exception during transport close: ${e.message}`);
+		    }
+		}
+	    } catch (e) {
+		Log.e(this.TAG, `Error during abort: ${e.message}`);
+	    } finally {
+		// Ensure nullification even if errors occur
+		this._transport = null;
+		this._reader = null;
+		this._packetBuffer = [];
+		this.tsBuffer = null;
+		this._readInProgress = false;
+		this._streamSwitchPending = false;
+		this._status = LoaderStatus.kComplete;
+
+		Log.v(this.TAG, "WebTransport connection cleanup complete");
+	    }
+	}
+
+	    /**
+	     * Get stream health report with detailed statistics
+	     * @returns {Object} - Health report object
+	     */
+	    getStreamHealthReport() {
+		// Get rotation handler stats
+		const rotationStats = this.streamRotationHandler ? 
+		    this.streamRotationHandler.getStats() : {};
+		    
+		// Get active stream details
+		const streamDetails = [];
+		for (const [streamId, streamData] of this._activeStreams.entries()) {
+		    streamDetails.push({
+			id: streamId,
+			status: streamData.status,
+			durationMs: Date.now() - streamData.startTime,
+			bytesReceived: streamData.bytesReceived,
+			packetsProcessed: streamData.packetsProcessed,
+			error: streamData.error || null
+		    });
+		}
+		    
+		return {
+		    receivedBytes: this._receivedLength,
+		    packetStats: {
+			total: this.tsBuffer.stats.totalPacketsProcessed,
+			valid: this.tsBuffer.stats.validPackets,
+			invalid: this.tsBuffer.stats.invalidPackets
+		    },
+		    ptsStats: {
+			ptsFound: this.packetLogger.debugStats.validPTS,
+			lastPTS: this.packetLogger.lastValidPTS
+		    },
+		    rotationStats: rotationStats,
+		    streamCount: this._activeStreams.size,
+		    streamDetails: streamDetails,
+		    outputBufferLength: this._outputBuffer.length,
+		    lastFlushTime: this._lastFlushTime
+		};
+	    }
+	}
+
+	export default WebTransportLoader;
