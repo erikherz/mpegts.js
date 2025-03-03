@@ -829,44 +829,30 @@ class PacketLogger {
     }
 }
 
-/**
- * Main WebTransportLoader class - handles WebTransport streams with rotation support
- */
 class WebTransportLoader extends BaseLoader {
-    constructor(config = {}) {
+    constructor() {
         super('webtransport-loader');
         this.TAG = 'WebTransportLoader';
 
-        // Basic loader properties
         this._needStash = true;
         this._transport = null;
+        this._reader = null;
         this._requestAbort = false;
         this._receivedLength = 0;
         this.debugCounter = 0;
 
-        // Initialize testHarness with default empty implementation
-        this.testHarness = {
-            reset: () => {},
-            integrateWithLoader: () => {}
-        };
-
         // Configure settings
         this.config = {
-            enableStreamRotationHandler: config.enableStreamRotationHandler !== false,
-            minBufferTime: config.minBufferTime || 1000,     // Min time to buffer before output
-            maxBufferTime: config.maxBufferTime || 5000,     // Max time to buffer before forcing output
-            packetFlushThreshold: config.packetFlushThreshold || 100,  // Number of packets per chunk
-            maxConcurrentStreams: config.maxConcurrentStreams || 5,    // Max concurrent streams to handle
-            enableDetailedLogging: config.enableDetailedLogging || false,
-            connectionTimeout: config.connectionTimeout || 10000,      // Connection timeout in ms
-            reconnectAttempts: config.reconnectAttempts || 3,          // Number of reconnection attempts
-            reconnectDelay: config.reconnectDelay || 2000             // Delay between reconnection attempts
+            enableStreamRotationHandler: true,
+            minBufferTime: 1000,     // Min time to buffer before output
+            maxBufferTime: 5000,     // Max time to buffer before forcing output
+            packetFlushThreshold: 100,  // Number of packets per chunk
+            maxConcurrentStreams: 5,    // Max concurrent streams to handle
+            enableDetailedLogging: false
         };
 
-        // Initialize logging function
+        // Initialize with bound logging function
         const logFunction = (msg) => this.config.enableDetailedLogging ? Log.v(this.TAG, msg) : null;
-
-        // Initialize components
         this.tsBuffer = new MPEGTSBuffer(logFunction);
         this.packetLogger = new PacketLogger(logFunction);
         this.packetValidator = new TSPacketValidator({ onLog: logFunction });
@@ -880,143 +866,128 @@ class WebTransportLoader extends BaseLoader {
             flushThreshold: this.config.packetFlushThreshold
         });
 
-        // Stream tracking
+        // Initialize testHarness properly
+        this.testHarness = new MPEGTSTestHarness({
+            onLog: (msg) => { Log.v(this.TAG, msg); }
+        });
+// Stream tracking
         this._activeStreams = new Map();  // streamId -> {reader, startTime, status}
         this._streamIdCounter = 0;
         this._lastFlushTime = 0;
-        this._connectionAttempts = 0;
-
+        
         // Output buffering
         this.PACKETS_PER_CHUNK = this.config.packetFlushThreshold;
         this._packetBuffer = [];
         this._outputBuffer = [];
-
+        
         // Internal state
         this._isInitialized = false;
         this._connectionEstablished = false;
-
-        // Bind methods
-        this._monitorIncomingStreams = this._monitorIncomingStreams.bind(this);
-        this._processStreamData = this._processStreamData.bind(this);
-        this._flushOutputBuffer = this._flushOutputBuffer.bind(this);
+        
+        // Bind methods - core methods first
+        this._readChunks = this._readChunks.bind(this);
+        this._processPackets = this._processPackets.bind(this);
+        this._dispatchPacketChunk = this._dispatchPacketChunk.bind(this);
+        
+        // Then stream rotation related methods
+        if (typeof this._monitorIncomingStreams === 'function') {
+            this._monitorIncomingStreams = this._monitorIncomingStreams.bind(this);
+        }
+        
+        if (typeof this._processStreamData === 'function') {
+            this._processStreamData = this._processStreamData.bind(this);
+        }
+        
+        if (typeof this._handleProcessedPackets === 'function') {
+            this._handleProcessedPackets = this._handleProcessedPackets.bind(this);
+        }
+        
+        // Bind diagnostic method
         this.advancedStreamDiagnosis = this.advancedStreamDiagnosis.bind(this);
     }
 
+    static isSupported() {
+        try {
+            return typeof self.WebTransport !== 'undefined';
+        } catch (e) {
+            return false;
+        }
+    }
+
+    destroy() {
+        if (this._transport) {
+            this.abort();
+        }
+        super.destroy();
+    }
+
     async open(dataSource) {
+        this.testHarness.reset();
+        this.testHarness.integrateWithLoader(this);
+        
         try {
             if (!dataSource.url.startsWith('https://')) {
                 throw new Error('WebTransport requires HTTPS URL');
             }
 
-            // Store URL for potential reconnection
-            this._lastUrl = dataSource.url;
-            this._startTime = Date.now();
-            this._connectionAttempts++;
+            Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
 
-            Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url} (attempt ${this._connectionAttempts})`);
-
-            // Create connection with timeout
-            const connectionTimeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error('Connection timeout')), this.config.connectionTimeout);
-            });
-
-            // Create a new WebTransport instance
             this._transport = new WebTransport(dataSource.url);
-
-            // Set up proper error handler for connection
-            this._transport.closed
-                .then(() => {
-                    Log.v(this.TAG, "WebTransport connection closed gracefully");
-                    this._handleConnectionClosed();
-                })
-                .catch(error => {
-                    Log.e(this.TAG, `WebTransport connection closed with error: ${error.message}`);
-                    this._handleConnectionFailure(error);
-                });
-
-            // Wait for connection to be ready with timeout
-            await Promise.race([
-                this._transport.ready,
-                connectionTimeoutPromise
-            ]);
+            await this._transport.ready;
 
             Log.v(this.TAG, "WebTransport connection established successfully");
             this._connectionEstablished = true;
-            this._status = LoaderStatus.kBuffering;
-            this._connectionAttempts = 0; // Reset counter after successful connection
 
-            // Wait a small amount of time to ensure connection is stable
-            await new Promise(resolve => setTimeout(resolve, 100));
-
-            // Confirm the connection is still open
-            if (!this._transport || this._transport.closed) {
-                throw new Error('Connection closed immediately after establishment');
-            }
-
-            // Get incoming streams
             const incomingStreams = this._transport.incomingUnidirectionalStreams;
             if (!incomingStreams) {
                 throw new Error('Could not get incoming unidirectional streams');
             }
-
+            
             const streamReader = incomingStreams.getReader();
-
-            // Read the first stream with timeout
-            const streamTimeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error('Stream read timeout')), 5000);
-            });
-
-            const firstStreamResult = await Promise.race([
-                streamReader.read(),
-                streamTimeoutPromise
-            ]);
-
-            const { value: stream, done } = firstStreamResult;
-
+            const { value: stream, done } = await streamReader.read();
+            
             if (done || !stream) {
                 throw new Error('No incoming stream received');
             }
-
-            // Set up our reader with the first stream
-            this._reader = stream.getReader();
-
-            // Use testHarness if it exists
-            if (this.testHarness) {
-                this.testHarness.reset();
-                this.testHarness.integrateWithLoader(this);
+            
+            // Register the first stream with the rotation handler
+            const firstStreamId = `stream-${++this._streamIdCounter}`;
+            if (this.streamRotationHandler && this.config.enableStreamRotationHandler) {
+                this.streamRotationHandler.registerStream(firstStreamId);
             }
+            
+            // Track active stream
+            this._activeStreams.set(firstStreamId, {
+                reader: stream.getReader(),
+                startTime: Date.now(),
+                status: 'active',
+                bytesReceived: 0,
+                packetsProcessed: 0
+            });
+            
+            // Set up our reader with the first stream
+            this._reader = this._activeStreams.get(firstStreamId).reader;
+            this._status = LoaderStatus.kBuffering;
 
             // Start reading data from the first stream
             this._readChunks();
+            
+            // Start monitoring for additional streams if rotation is enabled
+            if (this.config.enableStreamRotationHandler) {
+                setTimeout(() => {
+                    this._monitorIncomingStreams(streamReader).catch(e => {
+                        Log.e(this.TAG, `Error in stream monitoring: ${e.message}`);
+                    });
+                }, 0);
+            }
 
-            // Start monitoring for additional streams in a separate async context
-            // to avoid blocking the main flow
-            setTimeout(() => {
-                this._monitorIncomingStreams(streamReader).catch(e => {
-                    Log.e(this.TAG, `Error in stream monitoring: ${e.message}`);
-                });
-            }, 0);
-
-            // Set up diagnostic timer with proper method call
             this.diagnosticTimer = setInterval(() => {
-                this.advancedStreamDiagnosis();
-            }, 10000);
+               this.advancedStreamDiagnosis();
+            }, 10000); // Run diagnosis every 10 seconds
 
         } catch (e) {
             Log.e(this.TAG, `Error opening WebTransport connection: ${e.message}`);
             this._status = LoaderStatus.kError;
-
-            // Attempt reconnection if configured
-            if (this._connectionAttempts < this.config.reconnectAttempts) {
-                Log.v(this.TAG, `Reconnecting in ${this.config.reconnectDelay/1000} seconds...`);
-                setTimeout(() => {
-                    if (!this._requestAbort) {
-                        this.open(dataSource);
-                    }
-                }, this.config.reconnectDelay);
-                return;
-            }
-
             if (this._onError) {
                 this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
             }
@@ -1029,17 +1000,15 @@ class WebTransportLoader extends BaseLoader {
             Log.e(this.TAG, "Cannot monitor streams: transport is null");
             return;
         }
-
+        
         if (this._transport.closed) {
             Log.e(this.TAG, "Cannot monitor streams: transport is closed");
             return;
         }
-
+        
         try {
             Log.v(this.TAG, "Monitoring for additional incoming streams");
-
-            let streamCounter = 1; // First stream is already being processed
-
+            
             while (!this._requestAbort) {
                 try {
                     // Check if transport is still valid before each read
@@ -1047,76 +1016,51 @@ class WebTransportLoader extends BaseLoader {
                         Log.e(this.TAG, "Transport is null during stream monitoring");
                         break;
                     }
-
+                    
                     if (this._transport.closed) {
                         Log.e(this.TAG, "Transport closed during stream monitoring");
                         break;
                     }
-
-                    // Set a timeout for the read operation
-                    const readTimeoutPromise = new Promise((_, reject) => {
-                        setTimeout(() => reject(new Error('Stream read timeout')), 30000);
-                    });
-
-                    // Read with timeout
-                    const readResult = await Promise.race([
-                        streamReader.read(),
-                        readTimeoutPromise
-                    ]);
-
-                    const { value: stream, done } = readResult;
-
+                    
+                    const { value: stream, done } = await streamReader.read();
+                    
                     if (done) {
                         Log.v(this.TAG, "No more incoming streams available");
                         break;
                     }
-
+                    
                     if (!stream) {
                         Log.w(this.TAG, "Received null stream, continuing");
                         continue;
                     }
-
-                    streamCounter++;
-                    const streamId = `stream-${streamCounter}`;
-                    Log.v(this.TAG, `New stream detected: ${streamId}, switching readers`);
-
+                    
+                    const streamId = `stream-${++this._streamIdCounter}`;
+                    Log.v(this.TAG, `New stream detected: ${streamId}`);
+                    
                     // Register the stream with the rotation handler
                     if (this.streamRotationHandler) {
                         this.streamRotationHandler.registerStream(streamId);
                     }
-
+                    
                     // Record the time of the stream switch for diagnostics
                     this._lastStreamSwitchTime = Date.now();
-
-                    // Wait for current read loop to complete if there is one
-                    if (this._reader) {
-                        try {
-                            // Signal that we're about to change readers
-                            this._streamSwitchPending = true;
-
-                            // Give time for current read loop to finish
-                            await new Promise(resolve => setTimeout(resolve, 50));
-
-                            // Cancel existing reader
-                            await this._reader.cancel("Switching to new stream").catch(e => {
-                                Log.w(this.TAG, `Error canceling reader: ${e.message}`);
-                            });
-                        } catch (e) {
-                            // Ignore errors when canceling the reader
-                        }
-                    }
-
-                    // Update reader to new stream
-                    this._reader = stream.getReader();
-
-                    // Start reading from the new stream
-                    this._readChunks();
-
-                    // Clear stream switch flag
-                    this._streamSwitchPending = false;
-                } catch (streamError) {
+                    
+                    // Store the stream and its reader
+                    const streamReader = stream.getReader();
+                    this._activeStreams.set(streamId, {
+                        reader: streamReader,
+                        startTime: Date.now(),
+                        status: 'active',
+                        bytesReceived: 0,
+                        packetsProcessed: 0
+                    });
+                    
+                    // Process the new stream in parallel
+                    this._processStreamData(streamId, streamReader);
+                }
+                catch (streamError) {
                     if (this._requestAbort) break;
-
+                    
                     Log.e(this.TAG, `Error reading stream: ${streamError.message}`);
                     // Continue trying to read more streams despite errors
                     await new Promise(resolve => setTimeout(resolve, 500));
@@ -1132,355 +1076,580 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
-    async _readChunks() {
-        // If a read operation is already in progress, don't start another one
-        if (this._readInProgress) {
+
+async _processStreamData(streamId, reader) {
+    if (!reader) {
+        const streamData = this._activeStreams.get(streamId);
+        if (!streamData || !streamData.reader) {
+            Log.e(this.TAG, `No reader available for stream ${streamId}`);
             return;
         }
-
-        this._readInProgress = true;
-
-        try {
-            let pendingData = new Uint8Array(0);
-
-            while (!this._requestAbort && !this._streamSwitchPending) {
-                try {
-                    // Check if reader is available
-                    if (!this._reader) {
-                        Log.e(this.TAG, "Reader is null, cannot read chunks");
-                        break;
-                    }
-
-                    // Check if transport is still valid
-                    if (!this._transport || this._transport.closed) {
-                        Log.e(this.TAG, "WebTransport connection is closed, cannot continue reading");
-                        break;
-                    }
-
-                    // Set up read timeout
-                    const readTimeout = new Promise((_, reject) => {
-                        setTimeout(() => reject(new Error('Read operation timeout')), 10000);
-                    });
-
-                    // Read with timeout
-                    const readResult = await Promise.race([
-                        this._reader.read(),
-                        readTimeout
-                    ]);
-
-                    const { value, done } = readResult;
-
-                    // Check abort flag again after the async read operation
-                    if (this._requestAbort || this._streamSwitchPending) break;
-
-                    if (done) {
-                        Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
-                        // Process any remaining valid data
-                        if (pendingData.length >= 188) {
-                            const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
-                            const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
+        reader = streamData.reader;
+    }
+    
+    Log.v(this.TAG, `Processing stream ${streamId}`);
+    
+    try {
+        let pendingData = new Uint8Array(0);
+        
+        while (!this._requestAbort) {
+            try {
+                const { value, done } = await reader.read();
+                
+                // Check abort flag after the async read operation
+                if (this._requestAbort) break;
+                
+                if (done) {
+                    // Stream ended
+                    Log.v(this.TAG, `Stream ${streamId} ended`);
+                    
+                    // Process any remaining valid data
+                    if (pendingData.length >= 188) {
+                        const validLength = Math.floor(pendingData.length / 188) * 188;
+                        
+                        if (this.config.enableStreamRotationHandler) {
+                            // Use rotation handler
+                            const result = this.streamRotationHandler.processStreamData(
+                                streamId, pendingData.slice(0, validLength), this.packetValidator
+                            );
+                            
+                            if (result && result.shouldFlush) {
+                                const packets = this.streamRotationHandler.flushBuffers();
+                                this._handleProcessedPackets(packets);
+                            }
+                        } else {
+                            // Use direct processing
+                            const packets = this.tsBuffer.addChunk(pendingData.slice(0, validLength));
                             if (packets) {
                                 this._processPackets(packets);
                             }
                         }
-                        break;
                     }
-
-                    if (value) {
-                        // Ensure we're working with Uint8Array
-                        let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-
-                        // Combine with any pending data from previous chunks
-                        if (pendingData.length > 0) {
-                            const newBuffer = new Uint8Array(pendingData.length + chunk.length);
-                            newBuffer.set(pendingData, 0);
-                            newBuffer.set(chunk, pendingData.length);
-                            chunk = newBuffer;
-                            pendingData = new Uint8Array(0);
+                    
+                    // Update stream status
+                    const streamData = this._activeStreams.get(streamId);
+                    if (streamData) {
+                        streamData.status = 'ended';
+                        this._activeStreams.set(streamId, streamData);
+                    }
+                    
+                    // Notify the rotation handler that the stream has ended
+                    if (this.streamRotationHandler) {
+                        const remainingPackets = this.streamRotationHandler.endStream(streamId);
+                        if (remainingPackets && remainingPackets.length > 0) {
+                            this._handleProcessedPackets(remainingPackets);
                         }
-
-                        // Find and align to the first valid sync byte pattern
-                        const syncIndex = this._findAlignedSyncByte(chunk);
-
-                        if (syncIndex === -1) {
-                            // No valid pattern found, store the chunk for next iteration
-                            pendingData = chunk;
-                            continue;
-                        } else if (syncIndex > 0) {
-                            // Skip data before the first valid sync byte
-                            chunk = chunk.slice(syncIndex);
-                        }
-
-                        // Process only complete 188-byte packets
-                        const validLength = Math.floor(chunk.length / 188) * 188;
-
-                        if (validLength > 0) {
-                            const validChunk = chunk.slice(0, validLength);
-                            const packets = this.tsBuffer.addChunk(validChunk);
-
+                    }
+                    
+                    break;
+                }
+                
+                if (value) {
+                    // Get chunk as Uint8Array
+                    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+                    
+                    // Update stream statistics
+                    const streamData = this._activeStreams.get(streamId);
+                    if (streamData) {
+                        streamData.bytesReceived += chunk.length;
+                        this._activeStreams.set(streamId, streamData);
+                    }
+                    
+                    // Combine with any pending data from previous chunks
+                    if (pendingData.length > 0) {
+                        const newBuffer = new Uint8Array(pendingData.length + chunk.length);
+                        newBuffer.set(pendingData, 0);
+                        newBuffer.set(chunk, pendingData.length);
+                        chunk = newBuffer;
+                        pendingData = new Uint8Array(0);
+                    }
+                    
+                    // Find and align to the first valid sync byte pattern
+                    const syncIndex = this._findAlignedSyncByte(chunk);
+                    
+                    if (syncIndex === -1) {
+                        // No valid pattern found, store the chunk for next iteration
+                        pendingData = chunk;
+                        continue;
+                    } else if (syncIndex > 0) {
+                        // Skip data before the first valid sync byte
+                        chunk = chunk.slice(syncIndex);
+                    }
+                    
+                    // Process only complete 188-byte packets
+                    const validLength = Math.floor(chunk.length / 188) * 188;
+                    
+                    if (validLength > 0) {
+                        if (this.config.enableStreamRotationHandler) {
+                            // Use rotation handler
+                            const result = this.streamRotationHandler.processStreamData(
+                                streamId, chunk.slice(0, validLength), this.packetValidator
+                            );
+                            
+                            // Update stream statistics
+                            if (result && streamData) {
+                                streamData.packetsProcessed += result.packetCount || 0;
+                                this._activeStreams.set(streamId, streamData);
+                            }
+                            
+                            // Check if we need to flush
+                            if (result && result.shouldFlush) {
+                                const packets = this.streamRotationHandler.flushBuffers();
+                                this._handleProcessedPackets(packets);
+                            }
+                        } else {
+                            // Use direct processing
+                            const packets = this.tsBuffer.addChunk(chunk.slice(0, validLength));
                             if (packets) {
                                 this._processPackets(packets);
+                                
+                                // Update stream statistics
+                                if (streamData) {
+                                    streamData.packetsProcessed += packets.length;
+                                    this._activeStreams.set(streamId, streamData);
+                                }
                             }
                         }
-
-                        // Store any remaining partial packet for the next chunk
-                        if (validLength < chunk.length) {
-                            pendingData = chunk.slice(validLength);
-                        }
                     }
-                } catch (readError) {
-                    // If the error is due to abort or stream switch, handle gracefully
-                    if (this._requestAbort || this._streamSwitchPending) {
-                        break;
+                    
+                    // Store any remaining partial packet for the next chunk
+                    if (validLength < chunk.length) {
+                        pendingData = chunk.slice(validLength);
                     }
-
-                    // Check if the connection is closed
-                    if (!this._transport || this._transport.closed) {
-                        Log.e(this.TAG, "WebTransport connection is closed, cannot continue reading");
-                        break;
-                    }
-
-                    // Log the error but continue reading if possible
-                    Log.e(this.TAG, `Error reading chunk: ${readError.message}`);
-
-                    // Small delay before retry
-                    await new Promise(resolve => setTimeout(resolve, 100));
                 }
-            }
-
-            // Flush any remaining packets if we're not aborting
-            if (this._packetBuffer.length > 0 && !this._requestAbort) {
-                this._dispatchPacketChunk();
-            }
-
-        } catch (e) {
-            Log.e(this.TAG, `Error in _readChunks: ${e.message}`);
-            if (e.stack) {
-                Log.e(this.TAG, e.stack);
-            }
-
-            if (!this._requestAbort) {
-                this._status = LoaderStatus.kError;
-                if (this._onError) {
-                    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+            } catch (readError) {
+                // If the error is due to abort, handle gracefully
+                if (this._requestAbort) {
+                    break;
                 }
+                
+                Log.e(this.TAG, `Error reading from stream ${streamId}: ${readError.message}`);
+                
+                // Update stream status
+                const streamData = this._activeStreams.get(streamId);
+                if (streamData) {
+                    streamData.status = 'error';
+                    streamData.error = readError.message;
+                    this._activeStreams.set(streamId, streamData);
+                }
+                
+                // Small delay before retry
+                await new Promise(resolve => setTimeout(resolve, 100));
             }
-        } finally {
-            this._readInProgress = false;
-
-            // If we're switching streams, signal that we've finished
-            if (this._streamSwitchPending) {
-                Log.v(this.TAG, "Read operation terminated due to stream switch");
+        }
+    } catch (e) {
+        if (!this._requestAbort) {
+            Log.e(this.TAG, `Error processing stream ${streamId}: ${e.message}`);
+            
+            // Update stream status
+            const streamData = this._activeStreams.get(streamId);
+            if (streamData) {
+                streamData.status = 'error';
+                streamData.error = e.message;
+                this._activeStreams.set(streamId, streamData);
             }
         }
     }
+}
 
-    _findAlignedSyncByte(buffer) {
-        if (!buffer || buffer.length < 188) {
-            return -1;
-        }
-
-        // Find all potential sync bytes
-        const potential = [];
-        for (let i = 0; i < Math.min(buffer.length, 188); i++) {
-            if (buffer[i] === 0x47) {
-                potential.push(i);
-            }
-        }
-
-        // Check alignment pattern
-        for (const index of potential) {
-            // Check if we can find multiple sync bytes at 188-byte intervals
-            let validCount = 1;
-            let totalChecks = Math.min(3, Math.floor((buffer.length - index) / 188));
-
-            for (let j = 1; j <= totalChecks; j++) {
-                if (buffer[index + (j * 188)] === 0x47) {
-                    validCount++;
-                }
-            }
-
-            // If we found at least 2 aligned sync bytes (or 1 if it's all we can check)
-            if (validCount >= 2 || (totalChecks < 2 && validCount >= 1)) {
-                return index;
-            }
-        }
-
-        // If strict check fails but we have a potential sync byte, use it
-        return potential.length > 0 ? potential[0] : -1;
+_handleProcessedPackets(packets) {
+    if (!packets || packets.length === 0) {
+        return;
     }
+    
+    // Add packets to our output buffer
+    this._outputBuffer.push(...packets);
+    
+    // Check if we have enough packets to dispatch
+    if (this._outputBuffer.length >= this.PACKETS_PER_CHUNK) {
+        this._flushOutputBuffer();
+    }
+}
 
-    _processPackets(packets) {
-        if (!packets || packets.length === 0) {
-            return;
+_flushOutputBuffer() {
+    if (this._outputBuffer.length === 0) {
+        return false;
+    }
+    
+    const packetsToDispatch = this._outputBuffer.splice(0, 
+        Math.min(this._outputBuffer.length, this.PACKETS_PER_CHUNK * 2));
+    
+    // Combine packets into a single chunk
+    const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
+    const chunk = new Uint8Array(totalLength);
+    
+    let offset = 0;
+    packetsToDispatch.forEach(packet => {
+        chunk.set(packet, offset);
+        offset += packet.length;
+    });
+    
+    // Update total received length
+    this._receivedLength += totalLength;
+    
+    // Send to demuxer
+    if (this._onDataArrival) {
+        this._onDataArrival(chunk.buffer, 0, totalLength);
+    }
+    
+    return true;
+}
+
+_processPackets(packets) {
+    if (!packets || !Array.isArray(packets)) return;
+                
+    const now = Date.now();
+    let validPackets = [];
+    
+    packets.forEach(packet => {
+        if (packet instanceof Uint8Array && packet.length === 188) {
+            // Validate individual packet
+            if (packet[0] !== 0x47) {
+                return; // Skip invalid packet
+            }
+            
+            this._receivedLength += packet.length;
+            this.packetLogger.logPacket(packet, now);
+            validPackets.push(packet);
         }
-
-        // Keep track of the received length
-        this._receivedLength += packets.reduce((sum, packet) => sum + packet.length, 0);
-
-        // Add packets to buffer
-        this._packetBuffer.push(...packets);
-
-        // Check if we have enough packets to dispatch
+    });
+    
+    // Only add valid packets to the buffer
+    if (validPackets.length > 0) {
+        // Update the last packet time
+        this.lastPacketTime = Date.now();
+        
+        this._packetBuffer.push(...validPackets);
+        
+        // When we have enough packets, dispatch them as a chunk
         if (this._packetBuffer.length >= this.PACKETS_PER_CHUNK) {
             this._dispatchPacketChunk();
         }
     }
+}
 
-    _dispatchPacketChunk() {
-        if (this._packetBuffer.length === 0) {
-            return;
-        }
+_dispatchPacketChunk() {
+    if (this._packetBuffer.length === 0) return;
+    
+    // Combine packets into a single chunk
+    const totalLength = this._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
+    const chunk = new Uint8Array(totalLength);
+    
+    let offset = 0;
+    this._packetBuffer.forEach(packet => {
+        chunk.set(packet, offset);
+        offset += packet.length;
+    });
 
-        // Take packets up to the threshold
-        const packetCount = Math.min(this._packetBuffer.length, this.PACKETS_PER_CHUNK);
-        const packetsToDispatch = this._packetBuffer.splice(0, packetCount);
+    // Send the data to the demuxer
+    this._onDataArrival(chunk.buffer, 0, totalLength);
 
-        // Calculate total length
-        const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
+    // Clear the buffer
+    this._packetBuffer = [];
+}
 
-        // Create a single buffer from all packets
-        const chunk = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const packet of packetsToDispatch) {
-            chunk.set(packet, offset);
-            offset += packet.length;
-        }
+_findAlignedSyncByte(buffer) {
+    // Look for a pattern of sync bytes at 188-byte intervals
+    for (let i = 0; i <= buffer.length - 188*2; i++) {
+        if (buffer[i] === 0x47) {
+            // Check if we have multiple sync bytes at the expected interval
+            let validSyncCount = 1;
+            for (let j = 1; j <= 3; j++) {
+                const nextSyncPos = i + (j * 188);
+                if (nextSyncPos < buffer.length && buffer[nextSyncPos] === 0x47) {
+                    validSyncCount++;
+                } else {
+                    break;
+                }
+            }
 
-        // Send to demuxer
-        if (this._onDataArrival) {
-            this._onDataArrival(chunk.buffer, 0, totalLength);
+            // If we found at least 2 consecutive sync bytes at 188-byte intervals
+            if (validSyncCount >= 2) {
+                return i;
+            }
         }
     }
 
-    _handleConnectionClosed() {
-        if (this._requestAbort) {
-            return; // Normal shutdown, don't report as error
+    // Fallback: return the first sync byte we find
+    for (let i = 0; i < buffer.length; i++) {
+        if (buffer[i] === 0x47) {
+            return i;
         }
+    }
 
-        Log.e(this.TAG, "WebTransport connection closed unexpectedly");
+    return -1;
+}
 
+async _readChunks() {
+    try {
+        let pendingData = new Uint8Array(0);
+
+        while (true) {
+            if (this._requestAbort) {
+                Log.v(this.TAG, "Read loop terminated due to abort request");
+                break;
+            }
+            
+            try {
+                const { value, done } = await this._reader.read();
+                
+                // Check abort flag again after the async read operation
+                if (this._requestAbort) break;
+                
+                if (done) {
+                    // Process any remaining valid data
+                    if (pendingData.length >= 188) {
+                        const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
+                        const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
+                        if (packets) {
+                            this._processPackets(packets);
+                        }
+                    }
+                    break;
+                }
+
+                if (value) {
+                    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+                    
+                    // Combine with any pending data from previous chunks
+                    if (pendingData.length > 0) {
+                        const newBuffer = new Uint8Array(pendingData.length + chunk.length);
+                        newBuffer.set(pendingData, 0);
+                        newBuffer.set(chunk, pendingData.length);
+                        chunk = newBuffer;
+                        pendingData = new Uint8Array(0);
+                    }
+                    
+                    // Find and align to the first valid sync byte pattern
+                    const syncIndex = this._findAlignedSyncByte(chunk);
+                    
+                    if (syncIndex === -1) {
+                        // No valid pattern found, store the chunk for next iteration
+                        pendingData = chunk;
+                        continue;
+                    } else if (syncIndex > 0) {
+                        // Skip data before the first valid sync byte
+                        chunk = chunk.slice(syncIndex);
+                    }
+                    
+                    // Process only complete 188-byte packets
+                    const validLength = Math.floor(chunk.length / 188) * 188;
+                    
+                    if (validLength > 0) {
+                        const validChunk = chunk.slice(0, validLength);
+                        const packets = this.tsBuffer.addChunk(validChunk);
+                        
+                        if (packets) {
+                            this._processPackets(packets);
+                        }
+                    }
+                    
+                    // Store any remaining partial packet for the next chunk
+                    if (validLength < chunk.length) {
+                        pendingData = chunk.slice(validLength);
+                    }
+                }
+            } catch (readError) {
+                // If the error is due to abort, handle gracefully
+                if (this._requestAbort) {
+                    break;
+                }
+                // Otherwise re-throw for the outer catch to handle
+                throw readError;
+            }
+        }
+        
+        // Flush any remaining packets if we're not aborting
+        if (this._packetBuffer.length > 0 && !this._requestAbort) {
+            this._dispatchPacketChunk();
+        }
+        
+    } catch (e) {
+        Log.e(this.TAG, `Error in _readChunks: ${e.message}`);
+        if (e.stack) {
+            Log.e(this.TAG, e.stack);
+        }
+        
         this._status = LoaderStatus.kError;
         if (this._onError) {
-            this._onError(LoaderErrors.CONNECTION_ERROR, {
-                code: -1,
-                msg: "WebTransport connection closed unexpectedly"
+            this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+        }
+    }
+}
+
+advancedStreamDiagnosis() {
+    // Skip if already shut down
+    if (this._requestAbort) return;
+    
+    try {
+        Log.v(this.TAG, "========= MPEG-TS STREAM DIAGNOSTIC REPORT =========");
+        
+        // Connection status
+        const transportState = this._transport ?
+            (this._transport.closed ? 'closed' : 'open') : 'null';
+        Log.v(this.TAG, `WebTransport State: ${transportState}`);
+        
+        if (this._transport) {
+            Log.v(this.TAG, `Ready Promise: ${this._transport.ready ? 'resolved' : 'pending'}`);
+        }
+        
+        Log.v(this.TAG, `Connection Established: ${this._connectionEstablished ? 'YES' : 'no'}`);
+        Log.v(this.TAG, `Current Reader: ${this._reader ? 'active' : 'none'}`);
+        Log.v(this.TAG, `Total Bytes Received: ${this._receivedLength}`);
+        
+        // Stream rotation status
+        if (this.config.enableStreamRotationHandler && this.streamRotationHandler) {
+            const stats = this.streamRotationHandler.getStats();
+            Log.v(this.TAG, "Stream Rotation Stats:");
+            Log.v(this.TAG, `  Active Streams: ${stats.activeStreams}`);
+            Log.v(this.TAG, `  Total Streams Received: ${stats.streamsReceived}`);
+            Log.v(this.TAG, `  Streams Switched: ${stats.streamsSwitched}`);
+            Log.v(this.TAG, `  PTS Jumps: ${stats.ptsJumps}`);
+            Log.v(this.TAG, `  Stream Overlaps: ${stats.streamOverlaps}`);
+            Log.v(this.TAG, `  In Transition: ${stats.inTransition ? 'YES' : 'no'}`);
+            Log.v(this.TAG, `  Buffered Packets: ${stats.bufferedPackets}`);
+        }
+        
+        // Active streams info
+        Log.v(this.TAG, `Active Streams: ${this._activeStreams.size}`);
+        for (const [streamId, stream] of this._activeStreams.entries()) {
+            Log.v(this.TAG, `  Stream ${streamId}: ${stream.status}`);
+            Log.v(this.TAG, `    Started: ${new Date(stream.startTime).toISOString()}`);
+            Log.v(this.TAG, `    Bytes Received: ${stream.bytesReceived}`);
+            Log.v(this.TAG, `    Packets Processed: ${stream.packetsProcessed}`);
+            if (stream.error) {
+                Log.v(this.TAG, `    Error: ${stream.error}`);
+            }
+        }
+        
+        // Buffer statistics
+        if (this.tsBuffer) {
+            Log.v(this.TAG, `TS Buffer statistics:`);
+            Log.v(this.TAG, `  Total packets processed: ${this.tsBuffer.stats.totalPacketsProcessed}`);
+            Log.v(this.TAG, `  Valid packets: ${this.tsBuffer.stats.validPackets}`);
+            Log.v(this.TAG, `  Invalid packets: ${this.tsBuffer.stats.invalidPackets}`);
+            Log.v(this.TAG, `  Invalid sync bytes: ${this.tsBuffer.stats.invalidSyncByteCount}`);
+        }
+        
+        // PTS statistics
+        if (this.packetLogger) {
+            Log.v(this.TAG, "PTS/timing statistics:");
+            Log.v(this.TAG, `  Video packets: ${this.packetLogger.debugStats.videoPIDPackets}`);
+            Log.v(this.TAG, `  PES packet starts: ${this.packetLogger.debugStats.pesStarts}`);
+            Log.v(this.TAG, `  Valid PTS found: ${this.packetLogger.debugStats.validPTS}`);
+            Log.v(this.TAG, `  Last PTS value: ${this.packetLogger.lastValidPTS}`);
+        }
+        
+        // Output buffer status
+        Log.v(this.TAG, `Packet buffer: ${this._packetBuffer.length} packets`);
+        Log.v(this.TAG, `Output buffer: ${this._outputBuffer.length} packets`);
+        
+        Log.v(this.TAG, "====================================================");
+    } catch (e) {
+        Log.e(this.TAG, `Error running diagnostics: ${e.message}`);
+    }
+}
+
+async abort() {
+    // First, clear any timers or intervals
+    if (this.diagnosticTimer) {
+        clearInterval(this.diagnosticTimer);
+        this.diagnosticTimer = null;
+    }
+    
+    // Signal abort request
+    this._requestAbort = true;
+    
+    try {
+        // Cancel all active stream readers
+        for (const [streamId, streamData] of this._activeStreams.entries()) {
+            if (streamData.reader) {
+                try {
+                    await streamData.reader.cancel("Loader aborted").catch(e => {
+                        Log.w(this.TAG, `Error canceling reader for stream ${streamId}: ${e.message}`);
+                    });
+                } catch (e) {
+                    // Ignore errors when canceling readers
+                }
+            }
+        }
+        
+        // Clear active streams
+        this._activeStreams.clear();
+        this._reader = null;
+        
+        // Flush any pending data from both buffers
+        if (this._packetBuffer.length > 0) {
+            this._dispatchPacketChunk();
+        }
+        
+        if (this._outputBuffer.length > 0) {
+            this._flushOutputBuffer();
+        }
+        
+        // Close the transport with a clean reason
+        if (this._transport && !this._transport.closed) {
+            Log.v(this.TAG, "Closing WebTransport connection...");
+            await this._transport.close({closeCode: 0, reason: "Player destroyed"}).catch(e => {
+                Log.w(this.TAG, `Error closing transport: ${e.message}`);
             });
         }
-    }
-
-    _handleConnectionFailure(error) {
-        if (this._requestAbort) {
-            return; // Normal shutdown, don't report as error
+    } catch (e) {
+        Log.e(this.TAG, `Error during abort: ${e.message}`);
+    } finally {
+        // Ensure nullification even if errors occur
+        this._transport = null;
+        this._packetBuffer = [];
+        this._outputBuffer = [];
+        this.tsBuffer = null;
+        if (this.streamRotationHandler) {
+            this.streamRotationHandler.reset();
         }
+        this._status = LoaderStatus.kComplete;
+        
+        Log.v(this.TAG, "WebTransport connection cleanup complete");
+    }
+}
 
-        Log.e(this.TAG, `WebTransport connection failure: ${error.message}`);
-
-        this._status = LoaderStatus.kError;
-        if (this._onError) {
-            this._onError(LoaderErrors.CONNECTION_ERROR, {
-                code: error.code || -1,
-                msg: `WebTransport connection error: ${error.message}`
+    getStreamHealthReport() {
+        // Get rotation handler stats
+        const rotationStats = this.streamRotationHandler ? 
+            this.streamRotationHandler.getStats() : {};
+            
+        // Get active stream details
+        const streamDetails = [];
+        for (const [streamId, streamData] of this._activeStreams.entries()) {
+            streamDetails.push({
+                id: streamId,
+                status: streamData.status,
+                durationMs: Date.now() - streamData.startTime,
+                bytesReceived: streamData.bytesReceived,
+                packetsProcessed: streamData.packetsProcessed,
+                error: streamData.error || null
             });
         }
+            
+        return {
+            receivedBytes: this._receivedLength,
+            packetStats: {
+                total: this.tsBuffer.stats.totalPacketsProcessed,
+                valid: this.tsBuffer.stats.validPackets,
+                invalid: this.tsBuffer.stats.invalidPackets
+            },
+            ptsStats: {
+                ptsFound: this.packetLogger.debugStats.validPTS,
+                lastPTS: this.packetLogger.lastValidPTS
+            },
+            rotationStats: rotationStats,
+            streamCount: this._activeStreams.size,
+            streamDetails: streamDetails,
+            outputBufferLength: this._outputBuffer.length,
+            lastFlushTime: this._lastFlushTime
+        };
     }
-
-    // Add the missing advanced stream diagnosis method
-    advancedStreamDiagnosis() {
-        // Skip if already shut down
-        if (this._requestAbort) return;
-
-        try {
-            Log.v(this.TAG, "========= MPEG-TS STREAM DIAGNOSTIC REPORT =========");
-
-            // Connection status
-            const transportState = this._transport ?
-                (this._transport.closed ? 'closed' : 'open') : 'null';
-            Log.v(this.TAG, `WebTransport State: ${transportState}`);
-
-            if (this._transport) {
-                Log.v(this.TAG, `Ready Promise: ${this._transport.ready ? 'resolved' : 'pending'}`);
-            }
-
-            Log.v(this.TAG, `Connection Established: ${this._connectionEstablished ? 'YES' : 'no'}`);
-            Log.v(this.TAG, `Current Reader: ${this._reader ? 'active' : 'none'}`);
-            Log.v(this.TAG, `Read In Progress: ${this._readInProgress ? 'YES' : 'no'}`);
-            Log.v(this.TAG, `Stream Switch Pending: ${this._streamSwitchPending ? 'YES' : 'no'}`);
-            Log.v(this.TAG, `Total Bytes Received: ${this._receivedLength}`);
-
-            // Buffer statistics
-            if (this.tsBuffer) {
-                Log.v(this.TAG, `TS Buffer statistics:`);
-                Log.v(this.TAG, `  Total packets processed: ${this.tsBuffer.stats.totalPacketsProcessed}`);
-                Log.v(this.TAG, `  Valid packets: ${this.tsBuffer.stats.validPackets}`);
-                Log.v(this.TAG, `  Invalid packets: ${this.tsBuffer.stats.invalidPackets}`);
-            }
-
-            // PTS statistics
-            if (this.packetLogger) {
-                Log.v(this.TAG, "PTS/timing statistics:");
-                Log.v(this.TAG, `  Valid PTS found: ${this.packetLogger.debugStats.validPTS}`);
-                Log.v(this.TAG, `  Last PTS value: ${this.packetLogger.lastValidPTS}`);
-            }
-
-            // Output buffer status
-            Log.v(this.TAG, `Current packet buffer: ${this._packetBuffer.length} packets`);
-            Log.v(this.TAG, `Connection Attempts: ${this._connectionAttempts}`);
-
-            Log.v(this.TAG, "====================================================");
-        } catch (e) {
-            Log.e(this.TAG, `Error running diagnostics: ${e.message}`);
-        }
-    }
-
-    async abort() {
-        // First, clear any timers or intervals
-        if (this.diagnosticTimer) {
-            clearInterval(this.diagnosticTimer);
-            this.diagnosticTimer = null;
-        }
-
-        // Signal abort request to stop all operations
-        this._requestAbort = true;
-
-        try {
-            // Cancel current reader if it exists
-            if (this._reader) {
-                try {
-                    await this._reader.cancel("Loader aborted").catch(e => {});
-                    this._reader = null;
-                } catch (e) {
-                    // Ignore errors during cleanup
-                }
-            }
-
-            // Ensure any pending data is processed
-            if (this._packetBuffer.length > 0) {
-                try {
-                    this._dispatchPacketChunk();
-                } catch (e) {
-                    // Ignore errors during final dispatch
-                }
-            }
-
-            // Close the transport with a clean reason
-            if (this._transport && !this._transport.closed) {
-                try {
-                    await this._transport.close({
-                        closeCode: 0,
-                        reason: "Player destroyed"
-                    }).catch(e => {});
-                } catch (e) {
-                    // Ignore errors during transport close
-                }
-            }
-        } finally {
-            // Ensure nullification even if errors occur
-            this._transport = null;
-            this._reader = null;
-            this._packetBuffer = [];
-            this._status = LoaderStatus.kComplete;
-        }
+    
+    getStreamQualityReport() {
+        return this.testHarness.generateReport();
     }
 }
 
