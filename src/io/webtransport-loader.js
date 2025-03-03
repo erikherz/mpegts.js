@@ -1191,27 +1191,56 @@ async open(dataSource) {
 
         Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
         this._dataSource = dataSource;
+        this._requestAbort = false;
 
-        // Simple WebTransport creation without options
+        // Create WebTransport connection
         this._transport = new WebTransport(dataSource.url);
+        
+        // Wait for the connection to be fully ready
         await this._transport.ready;
+        this._connectionEstablished = true;
+        
+        Log.v(this.TAG, "WebTransport connection established successfully");
+        
+        // Set up handlers for connection events
+        this._transport.closed
+            .then(info => {
+                this._onConnectionClosed(info);
+            })
+            .catch(error => {
+                this._onConnectionError(error);
+            });
 
-        // Get streams directly after connection established
+        // Get incoming streams directly after connection established
         const incomingStreams = this._transport.incomingUnidirectionalStreams;
         const streamReader = incomingStreams.getReader();
-        const { value: stream } = await streamReader.read();
-
-        if (!stream) {
+        
+        // Read the first stream
+        const { value: stream, done } = await streamReader.read();
+        streamReader.releaseLock();
+        
+        if (done || !stream) {
             throw new Error('No incoming stream received');
         }
-
+        
+        // Initialize the reader with the first stream
         this._reader = stream.getReader();
+        Log.v(this.TAG, "First stream obtained successfully");
+        
+        // Start heartbeat to keep connection alive
+        this._startHeartbeat();
+        
+        // Schedule periodic connection state checks
+        this._connectionCheckInterval = setInterval(() => {
+            this._checkConnectionState();
+        }, 5000);
+        
+        // Start reading from the stream
         this._status = LoaderStatus.kBuffering;
-
-        // Start reading immediately
         this._readChunks();
-
+        
     } catch (e) {
+        Log.e(this.TAG, `Error opening WebTransport: ${e.message}`);
         this._status = LoaderStatus.kError;
         if (this._onError) {
             this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
@@ -1219,12 +1248,111 @@ async open(dataSource) {
     }
 }
 
+async _getNextStream() {
+    try {
+        // Check that we have a valid transport that's fully initialized
+        if (!this._transport) {
+            Log.e(this.TAG, "Transport is null, cannot get next stream");
+            return false;
+        }
+
+        if (this._transport.closed) {
+            Log.e(this.TAG, "Transport is closed, cannot get next stream");
+            return false;
+        }
+
+        if (!this._connectionEstablished) {
+            Log.e(this.TAG, "Connection not fully established yet");
+            return false;
+        }
+
+        // Release the previous reader if any
+        this._reader = null;
+
+        Log.v(this.TAG, "Attempting to get next stream");
+
+        try {
+            // Get the incoming streams reader
+            const incomingStreams = this._transport.incomingUnidirectionalStreams;
+            const streamReader = incomingStreams.getReader();
+
+            // Try to read the next stream
+            const { value: stream, done } = await streamReader.read();
+
+            // Release the streams reader
+            streamReader.releaseLock();
+
+            if (done) {
+                Log.v(this.TAG, "No more streams available");
+                return false;
+            }
+
+            if (!stream) {
+                Log.w(this.TAG, "Received null stream");
+                return false;
+            }
+
+            // Got a new stream, create reader
+            this._reader = stream.getReader();
+
+            // Update statistics
+            const streamId = `stream-${this._streamIdCounter++}`;
+            Log.v(this.TAG, `New stream received: ${streamId}`);
+
+            if (this.streamRotationHandler) {
+                this.streamRotationHandler.registerStream(streamId);
+            }
+
+            if (this.testHarness && typeof this.testHarness.recordStreamSwitch === 'function') {
+                this.testHarness.recordStreamSwitch();
+            }
+
+            return true;
+        } catch (streamError) {
+            Log.e(this.TAG, `Error getting stream: ${streamError.message}`);
+            return false;
+        }
+    } catch (e) {
+        Log.e(this.TAG, `Error in _getNextStream: ${e.message}`);
+        return false;
+    }
+}
+
 _startHeartbeat() {
+    // Clear any existing heartbeat interval
+    if (this._heartbeatInterval) {
+        clearInterval(this._heartbeatInterval);
+        this._heartbeatInterval = null;
+    }
+    
+    // Set heartbeat failure count
+    this._heartbeatFailures = 0;
+    const MAX_CONSECUTIVE_FAILURES = 3;
+    
     // Send a heartbeat every 5 seconds to keep the connection alive
     this._heartbeatInterval = setInterval(async () => {
         try {
-            if (this._transport && !this._transport.closed) {
-                // Create a bidirectional stream as a heartbeat
+            if (!this._transport || this._transport.closed) {
+                this._heartbeatFailures++;
+                Log.w(this.TAG, `Cannot send heartbeat: transport closed (failure ${this._heartbeatFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+                
+                // If we have too many consecutive failures, try to reconnect
+                if (this._heartbeatFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    Log.w(this.TAG, "Too many heartbeat failures, attempting reconnection");
+                    clearInterval(this._heartbeatInterval);
+                    this._heartbeatInterval = null;
+                    
+                    // Trigger transport reconnection
+                    this._handleTransportClosure("Multiple heartbeat failures");
+                }
+                return;
+            }
+            
+            // Reset failure count on successful check
+            this._heartbeatFailures = 0;
+            
+            // Create a bidirectional stream as a heartbeat
+            try {
                 const stream = await this._transport.createBidirectionalStream();
                 const writer = stream.writable.getWriter();
 
@@ -1236,25 +1364,68 @@ _startHeartbeat() {
                 // Close the stream properly
                 await writer.close();
 
-                Log.v(this.TAG, "Heartbeat sent to keep connection alive");
-            } else {
-                Log.e(this.TAG, "Cannot send heartbeat: transport closed");
-                clearInterval(this._heartbeatInterval);
+                // Log success with lower frequency to avoid cluttering logs
+                if (Math.random() < 0.1) { // Only log approximately 10% of heartbeats
+                    Log.v(this.TAG, "Heartbeat sent to keep connection alive");
+                }
+            } catch (streamError) {
+                this._heartbeatFailures++;
+                Log.w(this.TAG, `Heartbeat stream error: ${streamError.message} (failure ${this._heartbeatFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+                
+                // If we have multiple failures creating streams, the connection might be failing
+                if (this._heartbeatFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    Log.w(this.TAG, "Too many heartbeat failures, attempting reconnection");
+                    clearInterval(this._heartbeatInterval);
+                    this._heartbeatInterval = null;
+                    
+                    // Trigger transport reconnection
+                    this._handleTransportClosure("Multiple heartbeat failures");
+                }
             }
         } catch (e) {
-            Log.w(this.TAG, `Heartbeat error: ${e.message}`);
+            this._heartbeatFailures++;
+            Log.w(this.TAG, `Heartbeat error: ${e.message} (failure ${this._heartbeatFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+            
+            // If we have too many consecutive failures, try to reconnect
+            if (this._heartbeatFailures >= MAX_CONSECUTIVE_FAILURES) {
+                Log.w(this.TAG, "Too many heartbeat failures, attempting reconnection");
+                clearInterval(this._heartbeatInterval);
+                this._heartbeatInterval = null;
+                
+                // Trigger transport reconnection
+                this._handleTransportClosure("Multiple heartbeat failures");
+            }
         }
     }, 5000);
 }
 
-_onConnectionClosed(info) {
-    // Handle normal closure
-    if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError) {
+async _onConnectionClosed(info) {
+    // Don't handle closure if we're already in the process of aborting
+    if (this._requestAbort) {
+        Log.v(this.TAG, "Connection closed during abort, ignoring");
+        return;
+    }
+    
+    Log.w(this.TAG, `WebTransport connection closed: ${JSON.stringify(info)}`);
+    
+    // Clean up heartbeat timer
+    if (this._heartbeatInterval) {
+        clearInterval(this._heartbeatInterval);
+        this._heartbeatInterval = null;
+    }
+    
+    // Try to handle the closure and reconnect
+    const reconnected = await this._handleTransportClosure(
+        `Connection closed with code ${info.closeCode}, reason: ${info.reason}`
+    );
+    
+    // If we couldn't reconnect and we're not already in error state, report error
+    if (!reconnected && this._status !== LoaderStatus.kError && this._status !== LoaderStatus.kComplete) {
         this._status = LoaderStatus.kError;
         if (this._onError) {
             this._onError(LoaderErrors.CONNECTION_ERROR, {
-                code: -1,
-                msg: `WebTransport connection closed: ${JSON.stringify(info)}`
+                code: info.closeCode || -1,
+                msg: `WebTransport connection closed: ${info.reason || "No reason provided"}`
             });
         }
     }
@@ -1317,30 +1488,65 @@ async _monitorStreams(streamReader) {
     }
 }
 
-_checkConnectionState() {
+async _checkConnectionState() {
+    // Skip checks if we're shutting down
+    if (this._requestAbort) {
+        return true;
+    }
+    
     // Check if transport is invalid or closed but we think it's active
     if ((this._transport === null || this._transport.closed) && 
         this._status !== LoaderStatus.kError && 
         this._status !== LoaderStatus.kComplete) {
         
-        Log.e(this.TAG, "WebTransport connection has closed unexpectedly");
+        Log.w(this.TAG, "WebTransport connection has closed unexpectedly");
         
-        // Set proper status
-        this._status = LoaderStatus.kError;
+        // Try to reconnect
+        const reconnected = await this._handleTransportClosure("Connection state check failed");
         
-        // Notify error handler
-        if (this._onError) {
-            this._onError(LoaderErrors.CONNECTION_ERROR, { 
-                code: -1, 
-                msg: "WebTransport connection closed unexpectedly" 
-            });
+        if (!reconnected) {
+            // Set proper status if reconnection failed
+            this._status = LoaderStatus.kError;
+            
+            // Notify error handler
+            if (this._onError) {
+                this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                    code: -1, 
+                    msg: "WebTransport connection closed unexpectedly and reconnection failed" 
+                });
+            }
+            
+            return false;
         }
         
-        // Clean up resources
-        this._cleanup();
-        
-        return false;
+        return true;
     }
+    
+    // Check for inactivity
+    const now = Date.now();
+    if (this.lastPacketTime && (now - this.lastPacketTime > 30000)) {
+        // No data received for 30 seconds
+        Log.w(this.TAG, `No data received for ${Math.floor((now - this.lastPacketTime)/1000)} seconds, checking connection`);
+        
+        // Try to reconnect if there's excessive inactivity
+        const reconnected = await this._handleTransportClosure("Excessive inactivity");
+        
+        if (!reconnected) {
+            // Set proper status if reconnection failed
+            this._status = LoaderStatus.kError;
+            
+            // Notify error handler
+            if (this._onError) {
+                this._onError(LoaderErrors.CONNECTION_ERROR, { 
+                    code: -1, 
+                    msg: "Connection inactive for too long and reconnection failed" 
+                });
+            }
+            
+            return false;
+        }
+    }
+    
     return true;
 }
 
@@ -1681,109 +1887,429 @@ _findAlignedSyncByte(buffer) {
     return -1;
 }
 
-	async _readChunks() {
-	    try {
-		let pendingData = new Uint8Array(0);
-		let debugCounter = 0;
+async _readChunks() {
+    try {
+        let pendingData = new Uint8Array(0);
+        let debugCounter = 0;
+        let retryCount = 0;
+        const MAX_RETRIES = 3;
 
-		while (true) {
-		    if (this._requestAbort) {
-			Log.v(this.TAG, "Read loop terminated due to abort request");
-			break;
-		    }
-		    
-		    try {
-			const { value, done } = await this._reader.read();
-			
-			// Check abort flag again after the async read operation
-			if (this._requestAbort) break;
-			
-			if (done) {
-			    //Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
-			    // Process any remaining valid data
-			    if (pendingData.length >= 188) {
-				const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
-				const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
-				if (packets) {
-				    this._processPackets(packets);
-				}
-			    }
-			    break;
-			}
+        while (!this._requestAbort) {
+            // Check if transport connection is still valid
+            if (!this._transport || this._transport.closed) {
+                Log.w(this.TAG, "Transport invalid during read loop");
 
-			if (value) {
-			    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-			    debugCounter++;
-			    
-			    // Combine with any pending data from previous chunks
-			    if (pendingData.length > 0) {
-				const newBuffer = new Uint8Array(pendingData.length + chunk.length);
-				newBuffer.set(pendingData, 0);
-				newBuffer.set(chunk, pendingData.length);
-				chunk = newBuffer;
-				pendingData = new Uint8Array(0);
-			    }
-			    
-			    // Find and align to the first valid sync byte pattern
-			    const syncIndex = this._findAlignedSyncByte(chunk);
-			    
-			    if (syncIndex === -1) {
-				// No valid pattern found, store the chunk for next iteration
-				pendingData = chunk;
-				Log.w(this.TAG, `No valid sync pattern found in chunk (${chunk.length} bytes)`);
-				continue;
-			    } else if (syncIndex > 0) {
-				// Skip data before the first valid sync byte
-				chunk = chunk.slice(syncIndex);
-				Log.d(this.TAG, `Aligned to sync byte at offset ${syncIndex}`);
-			    }
-			    
-			    // Process only complete 188-byte packets
-			    const validLength = Math.floor(chunk.length / 188) * 188;
-			    
-			    if (validLength > 0) {
-				const validChunk = chunk.slice(0, validLength);
-				const packets = this.tsBuffer.addChunk(validChunk);
-				
-				if (packets) {
-				    //Log.v(this.TAG, `Processing ${packets.length} valid packets from ${validLength} bytes`);
-				    this._processPackets(packets);
-				} else {
-				    Log.w(this.TAG, `Failed to extract valid packets from ${validLength} bytes`);
-				}
-			    }
-			    
-			    // Store any remaining partial packet for the next chunk
-			    if (validLength < chunk.length) {
-				pendingData = chunk.slice(validLength);
-				//Log.d(this.TAG, `Storing ${pendingData.length} bytes for next chunk`);
-			    }
-			}
-		    } catch (readError) {
-			// If the error is due to abort, handle gracefully
-			if (this._requestAbort) {
-			    Log.v(this.TAG, "Read operation aborted as requested");
-			    break;
-			}
-			// Otherwise re-throw for the outer catch to handle
-			throw readError;
-		    }
-		}
-		
-		// Flush any remaining packets if we're not aborting
-		if (this._packetBuffer.length > 0 && !this._requestAbort) {
-		    this._dispatchPacketChunk();
-		}
-		
-	    } catch (e) {
-		Log.e(this.TAG, `Error in _readChunks: ${e.message}`);
-		Log.e(this.TAG, e.stack);
-		this._status = LoaderStatus.kError;
-		if (this._onError) {
-		    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
-		}
-	    }
-	}
+                const reconnected = await this._handleTransportClosure("Transport invalid during read");
+                if (!reconnected) {
+                    Log.e(this.TAG, "Cannot recover transport, ending read loop");
+                    break;
+                }
+
+                // If we successfully reconnected, continue with the new reader
+                continue;
+            }
+
+            if (!this._reader) {
+                Log.e(this.TAG, "Reader is null, cannot read chunks");
+
+                // Try to recover by getting a new stream
+                if (retryCount < MAX_RETRIES && this._transport && !this._transport.closed) {
+                    Log.v(this.TAG, `Attempting to recover by getting a new stream (retry ${retryCount + 1}/${MAX_RETRIES})`);
+                    const success = await this._getNextStream();
+
+                    if (success) {
+                        Log.v(this.TAG, "Successfully recovered with new stream");
+                        retryCount = 0;
+                        continue;
+                    } else {
+                        retryCount++;
+                        // Wait a bit before retrying
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        continue;
+                    }
+                }
+
+                // If we reach here and still don't have a reader, try full reconnection
+                const reconnected = await this._handleTransportClosure("Reader unavailable");
+                if (!reconnected) {
+                    Log.e(this.TAG, "Cannot recover reader, ending read loop");
+                    break;
+                }
+                continue;
+            }
+
+            try {
+                const { value, done } = await this._reader.read();
+
+                // Check abort flag after the async read operation
+                if (this._requestAbort) break;
+
+                if (done) {
+                    Log.v(this.TAG, `Stream read complete after ${this._receivedLength} bytes`);
+
+                    // Process any remaining valid data
+                    if (pendingData.length >= 188) {
+                        const validPacketsLength = Math.floor(pendingData.length / 188) * 188;
+                        const packets = this.tsBuffer.addChunk(pendingData.slice(0, validPacketsLength));
+                        if (packets) {
+                            this._processPackets(packets);
+                        }
+                    }
+
+                    // First try to get the next stream from the same connection
+                    // Important: Check if transport is still valid before attempting
+                    if (this._transport && !this._transport.closed) {
+                        Log.v(this.TAG, "Attempting to get next stream on same connection");
+                        const gotNextStream = await this._getNextStream();
+
+                        if (gotNextStream) {
+                            Log.v(this.TAG, "Successfully switched to next stream");
+                            // Reset pending data for the new stream
+                            pendingData = new Uint8Array(0);
+                            retryCount = 0;
+                            continue;
+                        } else {
+                            Log.w(this.TAG, "No more streams available, attempting transport reconnection");
+                            // Try to reconnect the transport instead
+                            const reconnected = await this._handleTransportClosure("Stream ended with no next stream");
+                            if (reconnected) {
+                                pendingData = new Uint8Array(0);
+                                retryCount = 0;
+                                continue;
+                            } else {
+                                Log.e(this.TAG, "Failed to reconnect transport after stream end");
+                                break;
+                            }
+                        }
+                    } else {
+                        Log.w(this.TAG, "Transport closed or null when trying to get next stream");
+                        const reconnected = await this._handleTransportClosure("Transport invalid after stream end");
+                        if (reconnected) {
+                            pendingData = new Uint8Array(0);
+                            retryCount = 0;
+                            continue;
+                        } else {
+                            Log.e(this.TAG, "Failed to reconnect transport after stream end");
+                            break;
+                        }
+                    }
+                }
+
+                if (value) {
+                    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+                    debugCounter++;
+
+                    // Reset retry count since we're successfully receiving data
+                    retryCount = 0;
+
+                    // Combine with any pending data from previous chunks
+                    if (pendingData.length > 0) {
+                        const newBuffer = new Uint8Array(pendingData.length + chunk.length);
+                        newBuffer.set(pendingData, 0);
+                        newBuffer.set(chunk, pendingData.length);
+                        chunk = newBuffer;
+                        pendingData = new Uint8Array(0);
+                    }
+
+                    // Find and align to the first valid sync byte pattern
+                    const syncIndex = this._findAlignedSyncByte(chunk);
+
+                    if (syncIndex === -1) {
+                        // No valid pattern found, store the chunk for next iteration
+                        pendingData = chunk;
+                        Log.w(this.TAG, `No valid sync pattern found in chunk (${chunk.length} bytes)`);
+                        continue;
+                    } else if (syncIndex > 0) {
+                        // Skip data before the first valid sync byte
+                        chunk = chunk.slice(syncIndex);
+                        Log.d(this.TAG, `Aligned to sync byte at offset ${syncIndex}`);
+                    }
+
+                    // Process only complete 188-byte packets
+                    const validLength = Math.floor(chunk.length / 188) * 188;
+
+                    if (validLength > 0) {
+                        const validChunk = chunk.slice(0, validLength);
+                        const packets = this.tsBuffer.addChunk(validChunk);
+
+                        if (packets) {
+                            this._processPackets(packets);
+                        } else {
+                            Log.w(this.TAG, `Failed to extract valid packets from ${validLength} bytes`);
+                        }
+                    }
+
+                    // Store any remaining partial packet for the next chunk
+                    if (validLength < chunk.length) {
+                        pendingData = chunk.slice(validLength);
+                    }
+                }
+            } catch (readError) {
+                // If the error is due to abort, handle gracefully
+                if (this._requestAbort) {
+                    Log.v(this.TAG, "Read operation aborted as requested");
+                    break;
+                }
+
+                Log.e(this.TAG, `Error reading from stream: ${readError.message}`);
+
+                // Check if the error is due to a closed transport
+                if (!this._transport || this._transport.closed) {
+                    Log.w(this.TAG, "Transport closed during read operation");
+                    const reconnected = await this._handleTransportClosure(`Read error: ${readError.message}`);
+                    if (reconnected) {
+                        pendingData = new Uint8Array(0);
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Try to recover by getting a new stream
+                if (retryCount < MAX_RETRIES && this._transport && !this._transport.closed) {
+                    Log.v(this.TAG, `Attempting to recover from read error (retry ${retryCount + 1}/${MAX_RETRIES})`);
+                    const success = await this._getNextStream();
+
+                    if (success) {
+                        Log.v(this.TAG, "Successfully recovered with new stream after error");
+                        pendingData = new Uint8Array(0);
+                        retryCount = 0;
+                        continue;
+                    } else {
+                        retryCount++;
+                        // Wait a bit before retrying
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        continue;
+                    }
+                }
+
+                // If recovery failed, try reconnecting the entire transport
+                const reconnected = await this._handleTransportClosure(`Read error: ${readError.message}`);
+                if (!reconnected) {
+                    // If reconnection failed, exit the loop
+                    break;
+                }
+                pendingData = new Uint8Array(0);
+                continue;
+            }
+        }
+
+        // Flush any remaining packets if we're not aborting
+        if (this._packetBuffer.length > 0 && !this._requestAbort) {
+            this._dispatchPacketChunk();
+        }
+
+    } catch (e) {
+        if (!this._requestAbort) {
+            Log.e(this.TAG, `Error in _readChunks: ${e.message}`);
+            Log.e(this.TAG, e.stack);
+            this._status = LoaderStatus.kError;
+            if (this._onError) {
+                this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+            }
+        }
+    }
+}
+
+async _handleTransportClosure(reason) {
+    try {
+        Log.w(this.TAG, `Transport closed unexpectedly: ${reason}`);
+        
+        // Don't attempt reconnection if we're shutting down
+        if (this._requestAbort) {
+            Log.v(this.TAG, "Not reconnecting due to abort request");
+            return false;
+        }
+        
+        // Mark the current transport as invalid
+        this._transport = null;
+        this._reader = null;
+        this._connectionEstablished = false;
+        
+        // Notify about temporary disconnection if needed
+        // but don't trigger a full error if we expect to reconnect
+        if (this._onReconnecting && typeof this._onReconnecting === 'function') {
+            this._onReconnecting();
+        }
+        
+        // Try to reconnect
+        const success = await this._reconnectTransport();
+        return success;
+    } catch (e) {
+        Log.e(this.TAG, `Error handling transport closure: ${e.message}`);
+        return false;
+    }
+}
+
+async _reconnectTransport() {
+    try {
+        if (!this._dataSource || !this._dataSource.url) {
+            Log.e(this.TAG, "Cannot reconnect: No data source URL available");
+            return false;
+        }
+        
+        // Max reconnection attempts
+        const MAX_RECONNECT_ATTEMPTS = 3;
+        let reconnectAttempt = 0;
+        let reconnectDelay = 1000; // Start with 1 second delay
+        
+        while (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+            if (this._requestAbort) {
+                Log.v(this.TAG, "Reconnection aborted by request");
+                return false;
+            }
+            
+            reconnectAttempt++;
+            Log.v(this.TAG, `Attempting to reconnect transport (attempt ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`);
+            
+            try {
+                // Make sure any existing reader is nullified
+                this._reader = null;
+                
+                // Ensure the old transport is properly cleaned up
+                if (this._transport && !this._transport.closed) {
+                    try {
+                        await this._transport.close();
+                    } catch (closeError) {
+                        // Ignore errors when closing the old transport
+                        Log.w(this.TAG, `Error closing old transport: ${closeError.message}`);
+                    }
+                }
+                
+                // Create a new WebTransport connection
+                this._transport = new WebTransport(this._dataSource.url);
+                
+                // Wait for the connection to be ready
+                await this._transport.ready;
+                this._connectionEstablished = true;
+                
+                // Set up connection event handlers
+                this._transport.closed.then(info => {
+                    this._onConnectionClosed(info);
+                }).catch(error => {
+                    this._onConnectionError(error);
+                });
+                
+                Log.v(this.TAG, "WebTransport reconnection successful");
+                
+                // Get the first stream from the new connection
+                const incomingStreams = this._transport.incomingUnidirectionalStreams;
+                const streamReader = incomingStreams.getReader();
+                
+                try {
+                    const { value: stream, done } = await streamReader.read();
+                    
+                    // Always release the reader lock
+                    streamReader.releaseLock();
+                    
+                    if (done || !stream) {
+                        Log.e(this.TAG, "Reconnection failed: No stream available on new connection");
+                        continue; // Try again
+                    }
+                    
+                    // Set up the reader for the new stream
+                    this._reader = stream.getReader();
+                    
+                    // Restart the heartbeat mechanism
+                    this._startHeartbeat();
+                    
+                    // Continue reading from the new stream
+                    this._readChunks();
+                    
+                    return true;
+                } catch (streamError) {
+                    // Make sure to release the stream reader lock
+                    try {
+                        streamReader.releaseLock();
+                    } catch (releaseError) {
+                        // Ignore errors when releasing lock
+                    }
+                    
+                    Log.e(this.TAG, `Error getting stream: ${streamError.message}`);
+                    continue; // Try again
+                }
+            } catch (e) {
+                Log.e(this.TAG, `Reconnection attempt ${reconnectAttempt} failed: ${e.message}`);
+                
+                // Wait before retrying, with exponential backoff
+                await new Promise(resolve => setTimeout(resolve, reconnectDelay));
+                reconnectDelay = Math.min(reconnectDelay * 2, 5000); // Maximum 5 second delay
+            }
+        }
+        
+        // If we reach here, all reconnection attempts failed
+        Log.e(this.TAG, `Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts`);
+        
+        // Report the error since we failed to reconnect
+        this._status = LoaderStatus.kError;
+        if (this._onError) {
+            this._onError(LoaderErrors.CONNECTION_ERROR, {
+                code: -1,
+                msg: `Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts`
+            });
+        }
+        
+        return false;
+    } catch (e) {
+        Log.e(this.TAG, `Error in reconnection process: ${e.message}`);
+        return false;
+    }
+}
+
+async _getNextStream() {
+    try {
+        if (!this._transport || this._transport.closed) {
+            Log.e(this.TAG, "Transport is closed or null, cannot get next stream");
+            return false;
+        }
+
+        // Release the previous reader if any
+        this._reader = null;
+
+        Log.v(this.TAG, "Attempting to get next stream");
+
+        // Get the incoming streams reader
+        const incomingStreams = this._transport.incomingUnidirectionalStreams;
+        const streamReader = incomingStreams.getReader();
+
+        // Try to read the next stream
+        const { value: stream, done } = await streamReader.read();
+
+        // Release the streams reader
+        streamReader.releaseLock();
+
+        if (done) {
+            Log.v(this.TAG, "No more streams available");
+            return false;
+        }
+
+        if (!stream) {
+            Log.w(this.TAG, "Received null stream");
+            return false;
+        }
+
+        // Got a new stream, create reader
+        this._reader = stream.getReader();
+
+        // Update statistics
+        const streamId = `stream-${this._streamIdCounter++}`;
+        Log.v(this.TAG, `New stream received: ${streamId}`);
+
+        if (this.streamRotationHandler) {
+            this.streamRotationHandler.registerStream(streamId);
+        }
+
+        if (this.testHarness && typeof this.testHarness.recordStreamSwitch === 'function') {
+            this.testHarness.recordStreamSwitch();
+        }
+
+        return true;
+    } catch (e) {
+        Log.e(this.TAG, `Error getting next stream: ${e.message}`);
+        return false;
+    }
+}
+
 async _monitorIncomingStreams() {
     try {
         Log.v(this.TAG, "Starting to monitor incoming streams");
