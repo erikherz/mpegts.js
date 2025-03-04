@@ -1108,7 +1108,7 @@ class WebTransportLoader extends BaseLoader {
 
         // Configure settings
         this.config = {
-            enableStreamRotationHandler: true,
+            enableStreamRotationHandler: false,
             minBufferTime: 1000,     // Min time to buffer before output
             maxBufferTime: 5000,     // Max time to buffer before forcing output
             packetFlushThreshold: 100,  // Number of packets per chunk
@@ -1597,162 +1597,6 @@ _cleanup() {
     Log.v(this.TAG, "Connection resources cleaned up");
 }
 
-async _processStreamData(streamId, reader) {
-    if (!reader) {
-        const streamData = this._activeStreams.get(streamId);
-        if (!streamData || !streamData.reader) {
-            Log.e(this.TAG, `No reader available for stream ${streamId}`);
-            return;
-        }
-        reader = streamData.reader;
-    }
-    
-    Log.v(this.TAG, `Processing stream ${streamId}`);
-    
-    try {
-        let pendingData = new Uint8Array(0);
-        
-        while (!this._requestAbort) {
-            try {
-                if (!this._transport || this._transport.closed) {
-                    Log.w(this.TAG, `Transport closed during stream ${streamId} processing`);
-                    break;
-                }
-                
-                const { value, done } = await reader.read();
-                
-                if (this._requestAbort) break;
-                
-                if (done) {
-                    Log.v(this.TAG, `Stream ${streamId} ended`);
-                    
-                    if (pendingData.length >= 188) {
-                        const validLength = Math.floor(pendingData.length / 188) * 188;
-                        
-                        if (this.config.enableStreamRotationHandler) {
-                            const result = this.streamRotationHandler.processStreamData(
-                                streamId, pendingData.slice(0, validLength), this.packetValidator
-                            );
-                            
-                            if (result && result.shouldFlush) {
-                                const packets = this.streamRotationHandler.flushBuffers();
-                                this._handleProcessedPackets(packets);
-                            }
-                        } else {
-                            const packets = this.tsBuffer.addChunk(pendingData.slice(0, validLength));
-                            if (packets) {
-                                this._processPackets(packets);
-                            }
-                        }
-                    }
-                    
-                    const streamData = this._activeStreams.get(streamId);
-                    if (streamData) {
-                        streamData.status = 'ended';
-                        this._activeStreams.set(streamId, streamData);
-                    }
-                    
-                    if (this.config.enableStreamRotationHandler) {
-                        const remainingPackets = this.streamRotationHandler.endStream(streamId);
-                        if (remainingPackets && remainingPackets.length > 0) {
-                            this._handleProcessedPackets(remainingPackets);
-                        }
-                    }
-                    
-                    break;
-                }
-                
-                if (value) {
-                    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-                    
-                    const streamData = this._activeStreams.get(streamId);
-                    if (streamData) {
-                        streamData.bytesReceived += chunk.length;
-                        this._activeStreams.set(streamId, streamData);
-                    }
-                    
-                    if (pendingData.length > 0) {
-                        const newBuffer = new Uint8Array(pendingData.length + chunk.length);
-                        newBuffer.set(pendingData, 0);
-                        newBuffer.set(chunk, pendingData.length);
-                        chunk = newBuffer;
-                        pendingData = new Uint8Array(0);
-                    }
-                    
-                    const syncIndex = this._findAlignedSyncByte(chunk);
-                    
-                    if (syncIndex === -1) {
-                        pendingData = chunk;
-                        continue;
-                    } else if (syncIndex > 0) {
-                        chunk = chunk.slice(syncIndex);
-                    }
-                    
-                    const validLength = Math.floor(chunk.length / 188) * 188;
-                    
-                    if (validLength > 0) {
-                        if (this.config.enableStreamRotationHandler) {
-                            const result = this.streamRotationHandler.processStreamData(
-                                streamId, chunk.slice(0, validLength), this.packetValidator
-                            );
-                            
-                            if (result && streamData) {
-                                streamData.packetsProcessed += result.packetCount || 0;
-                                this._activeStreams.set(streamId, streamData);
-                            }
-                            
-                            if (result && result.shouldFlush) {
-                                const packets = this.streamRotationHandler.flushBuffers();
-                                this._handleProcessedPackets(packets);
-                            }
-                        } else {
-                            const packets = this.tsBuffer.addChunk(chunk.slice(0, validLength));
-                            if (packets) {
-                                this._processPackets(packets);
-                                
-                                if (streamData) {
-                                    streamData.packetsProcessed += packets.length;
-                                    this._activeStreams.set(streamId, streamData);
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (validLength < chunk.length) {
-                        pendingData = chunk.slice(validLength);
-                    }
-                }
-            } catch (readError) {
-                if (this._requestAbort) {
-                    break;
-                }
-                
-                Log.e(this.TAG, `Error reading from stream ${streamId}: ${readError.message}`);
-                
-                const streamData = this._activeStreams.get(streamId);
-                if (streamData) {
-                    streamData.status = 'error';
-                    streamData.error = readError.message;
-                    this._activeStreams.set(streamId, streamData);
-                }
-                
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-        }
-    } catch (e) {
-        if (!this._requestAbort) {
-            Log.e(this.TAG, `Error processing stream ${streamId}: ${e.message}`);
-            
-            const streamData = this._activeStreams.get(streamId);
-            if (streamData) {
-                streamData.status = 'error';
-                streamData.error = e.message;
-                this._activeStreams.set(streamId, streamData);
-            }
-        }
-    }
-}
-
 _handleProcessedPackets(packets) {
     if (!packets || packets.length === 0) {
         return;
@@ -1914,19 +1758,42 @@ async _readChunks() {
     try {
         let pendingData = new Uint8Array(0);
         let readCount = 0;
+        let streamAttemptCount = 0;
+        const MAX_STREAM_ATTEMPTS = 3;
         
-        // Read as much as possible before the transport closes
+        // Main reading loop - continue until explicitly aborted
         while (!this._requestAbort) {
-            // Check transport validity at the beginning of each iteration
+            // Check that the transport is valid
             if (!this._transport || this._transport.closed) {
-                Log.w(this.TAG, "Transport is closed or null, exiting read loop");
-                break;
+                Log.w(this.TAG, "Transport is closed or null, attempting reconnection");
+                const reconnected = await this._reconnectTransport();
+                if (!reconnected) {
+                    Log.e(this.TAG, "Failed to reconnect transport, exiting read loop");
+                    break;
+                }
             }
             
-            // Check reader validity
+            // If we don't have an active reader, try to get a new stream
             if (!this._reader) {
-                Log.e(this.TAG, "Reader is null, cannot continue");
-                break;
+                Log.v(this.TAG, "No active reader, attempting to get a new stream");
+                const streamObtained = await this._getNextStream();
+                
+                if (!streamObtained) {
+                    streamAttemptCount++;
+                    if (streamAttemptCount >= MAX_STREAM_ATTEMPTS) {
+                        Log.e(this.TAG, `Failed to obtain a new stream after ${MAX_STREAM_ATTEMPTS} attempts, exiting read loop`);
+                        break;
+                    }
+                    
+                    // Wait a bit before retrying
+                    Log.v(this.TAG, `Stream attempt ${streamAttemptCount} failed, waiting before retry`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    continue;
+                }
+                
+                // Reset the attempt counter on success
+                streamAttemptCount = 0;
+                Log.v(this.TAG, "Successfully obtained new stream");
             }
             
             try {
@@ -1939,8 +1806,25 @@ async _readChunks() {
                 const { value, done } = await Promise.race([readPromise, timeoutPromise]);
                 
                 if (done) {
-                    Log.v(this.TAG, "Stream ended");
-                    break;
+                    Log.v(this.TAG, "Current stream ended, will try to get a new stream");
+                    
+                    // Process any remaining valid data from this stream
+                    if (pendingData.length >= 188) {
+                        const validLength = Math.floor(pendingData.length / 188) * 188;
+                        const validChunk = pendingData.slice(0, validLength);
+                        const packets = this.tsBuffer.addChunk(validChunk);
+                        
+                        if (packets) {
+                            this._processPackets(packets);
+                        }
+                    }
+                    
+                    // Clear pending data for the new stream
+                    pendingData = new Uint8Array(0);
+                    
+                    // Release current reader before getting a new one
+                    this._reader = null;
+                    continue; // Jump back to the top of the while loop to get a new stream
                 }
                 
                 if (value) {
@@ -1987,18 +1871,15 @@ async _readChunks() {
                         pendingData = chunk.slice(validLength);
                     }
                 }
-            } catch (e) {
+            } catch (readError) {
                 if (this._requestAbort) break;
                 
-                Log.e(this.TAG, `Error reading from stream: ${e.message}`);
+                Log.e(this.TAG, `Error reading from stream: ${readError.message}`);
                 
-                // The transport might have closed during read
-                if (!this._transport || this._transport.closed) {
-                    Log.w(this.TAG, "Transport closed during read operation");
-                    break;
-                }
+                // Handle reader error - release the current reader to force getting a new one
+                this._reader = null;
                 
-                // For other errors, try to continue
+                // Brief pause before trying again
                 await new Promise(resolve => setTimeout(resolve, 100));
             }
         }
@@ -2545,253 +2426,94 @@ async _reconnectTransport() {
     }
 }
 
-async _safeAcquireStream() {
-    // Validate state
-    if (this._readerState !== 'none') {
-        Log.w(this.TAG, `Cannot acquire stream, reader state is ${this._readerState}`);
-        return false;
-    }
-    
-    if (this._connectionState !== 'connected') {
-        Log.w(this.TAG, `Cannot acquire stream, connection state is ${this._connectionState}`);
-        return false;
-    }
-    
-    // Mark that we're acquiring
-    this._readerState = 'acquiring';
-    
-    try {
-        // IMPORTANT: Add more thorough validation of transport
-        if (!this._transport) {
-            Log.e(this.TAG, "Transport is null when trying to acquire stream");
-            this._readerState = 'none';
-            this._connectionState = 'idle'; // Reset connection state
-            return false;
-        }
-        
-        if (this._transport.closed) {
-            Log.e(this.TAG, "Transport is closed when trying to acquire stream");
-            this._readerState = 'none';
-            this._connectionState = 'idle'; // Reset connection state
-            return false;
-        }
-        
-        // IMPORTANT: Wait a small amount of time to ensure connection is stable
-        await new Promise(resolve => setTimeout(resolve, 50));
-        
-        // Check again after the short delay
-        if (!this._transport || this._transport.closed) {
-            Log.e(this.TAG, "Transport became invalid during acquisition delay");
-            this._readerState = 'none';
-            this._connectionState = 'idle';
-            return false;
-        }
-        
-        // Get streams safely with timeout protection
-        let streamReaderAcquired = false;
-        let streamReader = null;
-        
-        try {
-            Log.v(this.TAG, "Getting incomingUnidirectionalStreams");
-            const incomingStreams = this._transport.incomingUnidirectionalStreams;
-            
-            Log.v(this.TAG, "Acquiring stream reader");
-            streamReader = incomingStreams.getReader();
-            streamReaderAcquired = true;
-            
-            Log.v(this.TAG, "Reading from stream reader");
-            const { value: stream, done } = await streamReader.read();
-            
-            // Always release the reader lock
-            if (streamReaderAcquired) {
-                try {
-                    Log.v(this.TAG, "Releasing stream reader lock");
-                    streamReader.releaseLock();
-                    streamReaderAcquired = false;
-                } catch (releaseError) {
-                    Log.w(this.TAG, `Error releasing stream reader lock: ${releaseError.message}`);
-                }
-            }
-            
-            if (done || !stream) {
-                Log.w(this.TAG, "No stream available");
-                this._readerState = 'none';
-                return false;
-            }
-            
-            // Now we have a stream, get its reader
-            Log.v(this.TAG, "Creating reader for received stream");
-            this._reader = stream.getReader();
-            this._readerState = 'active';
-            
-            const streamId = `stream-${this._streamIdCounter++}`;
-            Log.v(this.TAG, `New stream acquired: ${streamId}`);
-            
-            if (this.streamRotationHandler) {
-                this.streamRotationHandler.registerStream(streamId);
-            }
-            
-            return true;
-        } catch (e) {
-            // Make sure to release the lock on error
-            if (streamReaderAcquired && streamReader) {
-                try {
-                    Log.v(this.TAG, "Releasing stream reader lock after error");
-                    streamReader.releaseLock();
-                } catch (releaseError) {
-                    // Just log
-                    Log.w(this.TAG, `Error releasing stream reader after error: ${releaseError.message}`);
-                }
-            }
-            
-            throw e; // Re-throw to be caught by outer handler
-        }
-    } catch (e) {
-        Log.e(this.TAG, `Error acquiring stream: ${e.message}`);
-        this._readerState = 'none';
-        // Check if the error indicates a bad connection
-        if (e.message.includes("Transport") || e.message.includes("connection")) {
-            this._connectionState = 'idle';
-        }
-        return false;
-    }
-}
-
 async _getNextStream() {
     try {
-        if (!this._transport || this._transport.closed) {
-            Log.e(this.TAG, "Transport is closed or null, cannot get next stream");
+        // Check that we have a valid transport
+        if (!this._transport) {
+            Log.e(this.TAG, "Transport is null, cannot get next stream");
             return false;
         }
 
-        // IMPORTANT: Make sure to release the old reader first
+        if (this._transport.closed) {
+            Log.e(this.TAG, "Transport is closed, cannot get next stream");
+            return false;
+        }
+
+        // IMPORTANT: Make sure to release the old reader first if it exists
         if (this._reader) {
             try {
-                await this._reader.cancel("Getting new stream");
+                await this._reader.cancel("Getting new stream").catch(e => {
+                    Log.w(this.TAG, `Error canceling previous reader: ${e.message}`);
+                });
             } catch (e) {
-                Log.w(this.TAG, `Error canceling previous reader: ${e.message}`);
+                Log.w(this.TAG, `Error during reader cleanup: ${e.message}`);
             }
             this._reader = null;
         }
 
         Log.v(this.TAG, "Attempting to get next stream");
 
-        try {
-            // Get the incoming streams reader
-            const incomingStreams = this._transport.incomingUnidirectionalStreams;
-            const streamReader = incomingStreams.getReader();
-
-            // Try to read the next stream
-            const { value: stream, done } = await streamReader.read();
-
-            // CRITICAL: Always release the reader lock before returning
+        // Set up a timeout for the entire stream acquisition process
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Stream acquisition timeout")), 10000)
+        );
+        
+        // Wrap the stream acquisition in a promise that can be raced with the timeout
+        const streamAcquisitionPromise = (async () => {
             try {
-                streamReader.releaseLock();
-            } catch (e) {
-                Log.w(this.TAG, `Error releasing stream reader lock: ${e.message}`);
-            }
-
-            if (done) {
-                Log.v(this.TAG, "No more streams available");
-                return false;
-            }
-
-            if (!stream) {
-                Log.w(this.TAG, "Received null stream");
-                return false;
-            }
-
-            // Got a new stream, create reader
-            this._reader = stream.getReader();
-
-            // Update statistics
-            const streamId = `stream-${this._streamIdCounter++}`;
-            Log.v(this.TAG, `New stream received: ${streamId}`);
-
-            if (this.streamRotationHandler) {
-                this.streamRotationHandler.registerStream(streamId);
-            }
-
-            if (this.testHarness && typeof this.testHarness.recordStreamSwitch === 'function') {
-                this.testHarness.recordStreamSwitch();
-            }
-
-            return true;
-        } catch (streamError) {
-            Log.e(this.TAG, `Error getting stream: ${streamError.message}`);
-            return false;
-        }
-    } catch (e) {
-        Log.e(this.TAG, `Error in _getNextStream: ${e.message}`);
-        return false;
-    }
-}
-
-async _monitorIncomingStreams() {
-    try {
-        Log.v(this.TAG, "Starting to monitor incoming streams");
-        
-        if (!this._transport) {
-            Log.e(this.TAG, "Transport not available for stream monitoring");
-            return;
-        }
-        
-        const incomingStreams = this._transport.incomingUnidirectionalStreams;
-        const streamReader = incomingStreams.getReader();
-        
-        while (!this._requestAbort) {
-            try {
-                if (!this._transport || this._transport.closed) {
-                    Log.e(this.TAG, "Transport closed during stream monitoring");
-                    break;
-                }
+                // Get the incoming streams reader
+                const incomingStreams = this._transport.incomingUnidirectionalStreams;
+                const streamReader = incomingStreams.getReader();
                 
-                const { value: stream, done } = await streamReader.read();
-                
-                if (done) {
-                    Log.v(this.TAG, "No more incoming streams available");
-                    break;
-                }
-                
-                if (!stream) {
-                    Log.w(this.TAG, "Received null stream, continuing");
-                    continue;
-                }
-                
-                const streamId = `stream-${this._streamIdCounter++}`;
-                Log.v(this.TAG, `New stream received: ${streamId}`);
-                
-                const reader = stream.getReader();
-                
-                if (this.config.enableStreamRotationHandler) {
-                    this.streamRotationHandler.registerStream(streamId);
+                try {
+                    // Try to read the next stream
+                    const { value: stream, done } = await streamReader.read();
+                    
+                    if (done) {
+                        Log.v(this.TAG, "No more streams available");
+                        return false;
+                    }
+                    
+                    if (!stream) {
+                        Log.w(this.TAG, "Received null stream");
+                        return false;
+                    }
+                    
+                    // Got a new stream, create reader
+                    this._reader = stream.getReader();
+                    
+                    // Update statistics
+                    const streamId = `stream-${this._streamIdCounter++}`;
+                    Log.v(this.TAG, `New stream received: ${streamId}`);
+                    
+                    if (this.streamRotationHandler) {
+                        this.streamRotationHandler.registerStream(streamId);
+                    }
                     
                     if (this.testHarness && typeof this.testHarness.recordStreamSwitch === 'function') {
                         this.testHarness.recordStreamSwitch();
                     }
+                    
+                    return true;
+                } finally {
+                    // CRITICAL: Always release the streams reader
+                    try {
+                        streamReader.releaseLock();
+                    } catch (e) {
+                        Log.w(this.TAG, `Error releasing stream reader: ${e.message}`);
+                    }
                 }
-                
-                this._activeStreams.set(streamId, {
-                    reader: reader,
-                    startTime: Date.now(),
-                    status: 'active',
-                    bytesReceived: 0,
-                    packetsProcessed: 0,
-                    error: null
-                });
-                
-                this._processStreamData(streamId, reader);
             } catch (e) {
-                if (this._requestAbort) break;
-                
-                Log.e(this.TAG, `Error in stream monitoring: ${e.message}`);
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                Log.e(this.TAG, `Error during stream acquisition: ${e.message}`);
+                return false;
             }
-        }
+        })();
+        
+        // Race the stream acquisition against the timeout
+        return await Promise.race([streamAcquisitionPromise, timeoutPromise]);
     } catch (e) {
-        if (!this._requestAbort) {
-            Log.e(this.TAG, `Stream monitor error: ${e.message}`);
-        }
+        Log.e(this.TAG, `Error in _getNextStream: ${e.message}`);
+        return false;
     }
 }
 
