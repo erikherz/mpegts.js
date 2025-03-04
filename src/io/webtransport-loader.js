@@ -314,6 +314,14 @@ class WebTransportLoader extends BaseLoader {
         this._requestAbort = false;
         this._receivedLength = 0;
 
+	this._dispatchErrorCount = 0;
+	this._maxConsecutiveErrors = 5;
+	this._dispatchPaused = false;
+	this._pauseStartTime = 0;
+	this._pauseDuration = 1000; // Initial pause of 1 second
+	this._maxPauseDuration = 10000; // Max pause of 10 seconds
+	this._errorTimer = null;
+
         // Configure settings with option overrides
         this.config = {
             // Logging
@@ -396,6 +404,62 @@ class WebTransportLoader extends BaseLoader {
         this._lastPerformanceCheck = Date.now();
         this._setupPerformanceMonitoring();
     }
+
+
+	_pauseDispatch() {
+	    if (this._dispatchPaused) return;
+	    
+	    this._dispatchPaused = true;
+	    this._pauseStartTime = Date.now();
+	    
+	    // Calculate pause duration with exponential backoff
+	    this._pauseDuration = Math.min(
+		this._maxPauseDuration,
+		this._pauseDuration * 2
+	    );
+	    
+	    Log.w(this.TAG, `Pausing dispatch for ${this._pauseDuration}ms due to errors`);
+	    
+	    // Schedule resuming dispatch
+	    this._errorTimer = setTimeout(() => {
+		this._resumeDispatch();
+	    }, this._pauseDuration);
+	    
+	    // If we have a very large buffer during error, drop some packets to prevent overflow
+	    if (this._packetBuffer.length > this.config.maxBufferSize * 0.75) {
+		const packetsToDrop = Math.floor(this._packetBuffer.length * 0.25); // Drop 25%
+		Log.w(this.TAG, `Dropping ${packetsToDrop} packets to prevent buffer overflow during error recovery`);
+		this._packetBuffer = this._packetBuffer.slice(packetsToDrop);
+		
+		// Update keyframe positions if needed
+		if (this.config.keyframeAwareChunking && this._keyframePositions.length > 0) {
+		    this._keyframePositions = this._keyframePositions
+			.map(pos => pos - packetsToDrop)
+			.filter(pos => pos >= 0);
+		    
+		    // Always ensure we have at least one keyframe at position 0
+		    if (this._keyframePositions.length === 0) {
+			this._keyframePositions.push(0);
+		    }
+		}
+	    }
+	}
+
+	_resumeDispatch() {
+	    if (!this._dispatchPaused) return;
+	    
+	    const pauseDuration = Date.now() - this._pauseStartTime;
+	    Log.v(this.TAG, `Resuming dispatch after ${pauseDuration}ms pause`);
+	    
+	    this._dispatchPaused = false;
+	    this._dispatchErrorCount = 0;
+	    
+	    // Try to dispatch a small chunk to test if errors are resolved
+	    if (this._packetBuffer.length > 0) {
+		const testDispatchSize = Math.min(20, this._packetBuffer.length);
+		this._dispatchPacketChunk(testDispatchSize);
+	    }
+	}
 
     /**
      * Set up performance monitoring for adaptive buffer management
@@ -565,164 +629,196 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
-    /**
-     * Dispatch a specific number of packets from the buffer
-     *
-     * @param {number} packetCount Number of packets to dispatch
-     */
-    _dispatchPacketChunk(packetCount) {
-        if (this._packetBuffer.length === 0 || packetCount <= 0) return;
+	/**
+	 * Dispatch a specific number of packets from the buffer
+	 * Enhanced with error detection and backoff
+	 *
+	 * @param {number} packetCount Number of packets to dispatch
+	 */
+	_dispatchPacketChunk(packetCount) {
+	    // Skip dispatch if paused due to errors
+	    if (this._dispatchPaused) {
+		if (this.config.enableDetailedLogging) {
+		    Log.v(this.TAG, `Dispatch paused due to errors, skipping dispatch`);
+		}
+		return;
+	    }
 
-        // Limit to available packets
-        const actualPacketsToDispatch = Math.min(packetCount, this._packetBuffer.length);
+	    if (this._packetBuffer.length === 0 || packetCount <= 0) return;
 
-        // Get packets to dispatch
-        const packetsToDispatch = this._packetBuffer.slice(0, actualPacketsToDispatch);
+	    // Limit to available packets
+	    const actualPacketsToDispatch = Math.min(packetCount, this._packetBuffer.length);
 
-        // Remove those packets from the buffer
-        this._packetBuffer = this._packetBuffer.slice(actualPacketsToDispatch);
+	    // Get packets to dispatch
+	    const packetsToDispatch = this._packetBuffer.slice(0, actualPacketsToDispatch);
 
-        // Combine packets into a single chunk
-        const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
-        const chunk = new Uint8Array(totalLength);
+	    // Remove those packets from the buffer
+	    this._packetBuffer = this._packetBuffer.slice(actualPacketsToDispatch);
 
-        let offset = 0;
-        packetsToDispatch.forEach(packet => {
-            chunk.set(packet, offset);
-            offset += packet.length;
-        });
+	    // Combine packets into a single chunk
+	    const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
+	    const chunk = new Uint8Array(totalLength);
 
-        // Log dispatch details if detailed logging is enabled
-        if (this.config.enableDetailedLogging) {
-            Log.v(this.TAG, `Dispatching ${actualPacketsToDispatch} packets (${(totalLength / 1024).toFixed(1)} KB), remaining buffer: ${this._packetBuffer.length} packets`);
-        }
+	    let offset = 0;
+	    packetsToDispatch.forEach(packet => {
+		chunk.set(packet, offset);
+		offset += packet.length;
+	    });
 
-        // Send to demuxer
-        if (this._onDataArrival) {
-            this._onDataArrival(chunk.buffer, 0, totalLength);
-        }
+	    // Log dispatch details if detailed logging is enabled
+	    if (this.config.enableDetailedLogging) {
+		Log.v(this.TAG, `Dispatching ${actualPacketsToDispatch} packets (${(totalLength / 1024).toFixed(1)} KB), remaining buffer: ${this._packetBuffer.length} packets`);
+	    }
 
-        // Update stats after dispatch
-        this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
-        this._recordDispatch(actualPacketsToDispatch);
-    }
+	    // Send to demuxer with error handling
+	    if (this._onDataArrival) {
+		try {
+		    this._onDataArrival(chunk.buffer, 0, totalLength);
+		    // Reset error count on successful dispatch
+		    this._dispatchErrorCount = 0;
+		} catch (e) {
+		    // Increment error count
+		    this._dispatchErrorCount++;
+		    Log.w(this.TAG, `Dispatch error ${this._dispatchErrorCount}/${this._maxConsecutiveErrors}: ${e.message}`);
+		    
+		    // If too many consecutive errors, pause dispatching temporarily
+		    if (this._dispatchErrorCount >= this._maxConsecutiveErrors) {
+			this._pauseDispatch();
+			
+			// Put packets back in buffer
+			this._packetBuffer = [...packetsToDispatch, ...this._packetBuffer];
+			
+			// Update stats after adding packets back
+			this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
+			
+			// Skip remaining processing since we've retained the packets
+			return;
+		    }
+		}
+	    }
 
-    static isSupported() {
-        try {
-            return typeof self.WebTransport !== 'undefined';
-        } catch (e) {
-            return false;
-        }
-    }
+	    // Update stats after dispatch
+	    this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
+	    this._recordDispatch(actualPacketsToDispatch);
+	}
 
-    async open(dataSource) {
-        try {
-            if (!dataSource.url.startsWith('https://')) {
-                throw new Error('WebTransport requires HTTPS URL');
-            }
+	/**
+	 * Abort all pending operations
+	 */
+	async abort() {
+	    this._requestAbort = true;
 
-            Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
+	    // Clear diagnostic timer
+	    if (this.diagnosticTimer) {
+		clearInterval(this.diagnosticTimer);
+		this.diagnosticTimer = null;
+	    }
+	    
+	    // Clear error backoff timer
+	    if (this._errorTimer) {
+		clearTimeout(this._errorTimer);
+		this._errorTimer = null;
+	    }
 
-            // Create WebTransport connection
-            this._transport = new WebTransport(dataSource.url);
-            await this._transport.ready;
+	    try {
+		// Cancel current stream reader if active
+		if (this._currentStreamReader) {
+		    await this._currentStreamReader.cancel("Loader aborted").catch(() => {});
+		    this._currentStreamReader = null;
+		}
 
-            // Set up error and close handlers
-            this._transport.closed.then(info => {
-                Log.v(this.TAG, `WebTransport connection closed: ${JSON.stringify(info)}`);
-                if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError) {
-                    this._status = LoaderStatus.kError;
-                    if (this._onError) {
-                        this._onError(LoaderErrors.CONNECTION_ERROR, {
-                            code: -1,
-                            msg: `WebTransport connection closed: ${JSON.stringify(info)}`
-                        });
-                    }
-                }
-            }).catch(error => {
-                Log.e(this.TAG, `WebTransport connection error: ${error.message}`);
-            });
+		// Cancel stream reader
+		if (this._streamReader) {
+		    await this._streamReader.cancel("Loader aborted").catch(() => {});
+		    this._streamReader = null;
+		}
 
-            // Start processing incoming streams
-            this._status = LoaderStatus.kBuffering;
-            this._streamReader = this._transport.incomingUnidirectionalStreams.getReader();
+		// Dispatch any remaining packets
+		if (this._packetBuffer.length > 0 && !this._dispatchPaused) {
+		    this._dispatchPacketChunk(this._packetBuffer.length);
+		}
 
-            // Reset buffer state
-            this._packetBuffer = [];
-            this._initialBufferingComplete = false;
-            this.stats.maxBufferSize = this.config.bufferSizeInPackets;
+		// Close transport
+		if (this._transport && !this._transport.closed) {
+		    await this._transport.close().catch(() => {});
+		}
 
-            // Start processing streams
-            this._processStreams();
+	    } catch (e) {
+		Log.e(this.TAG, `Error during abort: ${e.message}`);
+	    } finally {
+		this._transport = null;
+		this._packetBuffer = [];
+		this._status = LoaderStatus.kComplete;
+	    }
+	}
 
-            // Set up diagnostics timer if needed
-            this.diagnosticTimer = setInterval(() => {
-                this._logDiagnostics();
+	/**
+	 * Process incoming WebTransport streams
+	 * Enhanced with error handling reset on stream transitions
+	 */
+	async _processStreams() {
+	    try {
+		while (!this._requestAbort) {
+		    // Get the next stream
+		    const { value: stream, done } = await this._streamReader.read();
 
-                // Check for PTS continuity reset conditions
-                if (this.config.enablePTSContinuity) {
-                    this._ptsHandler.checkForResetConditions();
-                }
-            }, 10000);
+		    if (done) {
+			Log.v(this.TAG, "No more incoming streams available");
+			break;
+		    }
 
-        } catch (e) {
-            this._status = LoaderStatus.kError;
-            if (this._onError) {
-                this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
-            }
-        }
-    }
+		    if (!stream) {
+			Log.w(this.TAG, "Received null stream, waiting for next stream");
+			continue;
+		    }
 
-    async _processStreams() {
-        try {
-            while (!this._requestAbort) {
-                // Get the next stream
-                const { value: stream, done } = await this._streamReader.read();
+		    this.stats.streamsReceived++;
+		    this.stats.streamTransitionCount++;
+		    Log.v(this.TAG, `Received stream #${this.stats.streamsReceived}, processing...`);
 
-                if (done) {
-                    Log.v(this.TAG, "No more incoming streams available");
-                    break;
-                }
+		    // Log buffer status at stream transition for better debugging
+		    Log.v(this.TAG, `Buffer status at stream transition: ${this._packetBuffer.length} packets (${(this._packetBuffer.length * this.PACKET_SIZE / 1024).toFixed(1)} KB)`);
 
-                if (!stream) {
-                    Log.w(this.TAG, "Received null stream, waiting for next stream");
-                    continue;
-                }
+		    // Reset error handling on new stream
+		    this._dispatchErrorCount = 0;
+		    if (this._dispatchPaused) {
+			if (this._errorTimer) {
+			    clearTimeout(this._errorTimer);
+			    this._errorTimer = null;
+			}
+			this._dispatchPaused = false;
+			this._pauseDuration = 1000; // Reset to initial duration
+			Log.v(this.TAG, `Stream transition: Clearing error state and resuming dispatch`);
+		    }
 
-                this.stats.streamsReceived++;
-                Log.v(this.TAG, `Received stream #${this.stats.streamsReceived}, processing...`);
+		    // Notify PTS handler about stream transition if enabled
+		    if (this.config.enablePTSContinuity) {
+			this._ptsHandler.notifyStreamTransition();
+		    }
 
-                // Log buffer status at stream transition for better debugging
-                Log.v(this.TAG, `Buffer status at stream transition: ${this._packetBuffer.length} packets (${(this._packetBuffer.length * this.PACKET_SIZE / 1024).toFixed(1)} KB)`);
+		    // Process this stream until it's done
+		    this._currentStreamReader = stream.getReader();
+		    await this._readStreamData(this._currentStreamReader);
+		}
 
-                // Notify PTS handler about stream transition if enabled
-                if (this.config.enablePTSContinuity) {
-                    this._ptsHandler.notifyStreamTransition();
-                }
+		// Final flush of any remaining packets before closing
+		if (this._packetBuffer.length > 0 && !this._requestAbort && !this._dispatchPaused) {
+		    Log.v(this.TAG, `Final flush of remaining ${this._packetBuffer.length} packets`);
+		    this._dispatchPacketChunk(this._packetBuffer.length);
+		}
 
-                // Process this stream until it's done
-                this._currentStreamReader = stream.getReader();
-                await this._readStreamData(this._currentStreamReader);
-            }
+		Log.v(this.TAG, "Stream processing loop ended");
 
-            // Final flush of any remaining packets before closing
-            if (this._packetBuffer.length > 0 && !this._requestAbort) {
-                Log.v(this.TAG, `Final flush of remaining ${this._packetBuffer.length} packets`);
-                this._dispatchPacketChunk(this._packetBuffer.length);
-            }
-
-            Log.v(this.TAG, "Stream processing loop ended");
-
-        } catch (e) {
-            if (!this._requestAbort) {
-                Log.e(this.TAG, `Error in _processStreams: ${e.message}`);
-                this._status = LoaderStatus.kError;
-                if (this._onError) {
-                    this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
-                }
-            }
-        }
-    }
+	    } catch (e) {
+		if (!this._requestAbort) {
+		    Log.e(this.TAG, `Error in _processStreams: ${e.message}`);
+		    this._status = LoaderStatus.kError;
+		    if (this._onError) {
+			this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+		    }
+		}
+	    }
+	}
 
     _findSyncByteAlignment(buffer) {
         // Try to find a pattern of sync bytes at PACKET_SIZE intervals
@@ -1586,47 +1682,6 @@ async _readStreamData(reader) {
         } catch (e) {
             Log.w(this.TAG, `Error detecting keyframe: ${e.message}`);
             return false;
-        }
-    }
-
-    async abort() {
-        this._requestAbort = true;
-
-        // Clear diagnostic timer
-        if (this.diagnosticTimer) {
-            clearInterval(this.diagnosticTimer);
-            this.diagnosticTimer = null;
-        }
-
-        try {
-            // Cancel current stream reader if active
-            if (this._currentStreamReader) {
-                await this._currentStreamReader.cancel("Loader aborted").catch(() => {});
-                this._currentStreamReader = null;
-            }
-
-            // Cancel stream reader
-            if (this._streamReader) {
-                await this._streamReader.cancel("Loader aborted").catch(() => {});
-                this._streamReader = null;
-            }
-
-            // Dispatch any remaining packets
-            if (this._packetBuffer.length > 0) {
-                this._dispatchPacketChunk(this._packetBuffer.length);
-            }
-
-            // Close transport
-            if (this._transport && !this._transport.closed) {
-                await this._transport.close().catch(() => {});
-            }
-
-        } catch (e) {
-            Log.e(this.TAG, `Error during abort: ${e.message}`);
-        } finally {
-            this._transport = null;
-            this._packetBuffer = [];
-            this._status = LoaderStatus.kComplete;
         }
     }
 
