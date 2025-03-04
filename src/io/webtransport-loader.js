@@ -156,29 +156,144 @@ class PTSContinuityHandler {
     }
 
     /**
-     * Reset timestamp continuity tracking
-     * This should be called during seek operations
+     * Apply the calculated offset to a PTS value
+     *
+     * @param {number} pts Original PTS value
+     * @param {string} streamType The stream type ('video' or 'audio')
+     * @return {number} Adjusted PTS value
      */
-    resetPTSContinuity() {
-        if (this.config.enablePTSContinuity && this._ptsHandler) {
-            this._ptsHandler.reset();
-            Log.v(this.TAG, "PTS continuity tracking has been reset");
+    _applyOffset(pts, streamType) {
+        let adjustedPTS = pts + this._ptsOffsets[streamType];
 
-            // Reset stats
-            this.stats.lastPTS = {
-                video: null,
-                audio: null
-            };
-            this.stats.ptsAdjustments = {
-                video: 0,
-                audio: 0
-            };
+        // Handle wraparound for adjusted PTS
+        if (adjustedPTS > this.PTS_MAX_VALUE) {
+            adjustedPTS -= this.PTS_MAX_VALUE + 1;
+        } else if (adjustedPTS < 0) {
+            adjustedPTS += this.PTS_MAX_VALUE + 1;
         }
 
-        // Reset keyframe tracking
-        this._keyframePositions = [];
-        this._lastDispatchedKeyframeIndex = -1;
-        this.stats.keyframesDetected = 0;
+        return adjustedPTS;
+    }
+
+    /**
+     * Check if PTS value is approaching wraparound
+     *
+     * @param {number} pts The PTS value to check
+     * @return {boolean} True if PTS is approaching wraparound
+     */
+    isApproachingWraparound(pts) {
+        return pts > this.PTS_WRAPAROUND_THRESHOLD;
+    }
+
+    /**
+     * Reset continuity tracking
+     * This should be called when a full reset is needed (e.g., seek operation)
+     */
+    reset() {
+        this._lastPTS = {
+            video: null,
+            audio: null
+        };
+
+        this._ptsOffsets = {
+            video: 0,
+            audio: 0
+        };
+
+        this._streamTransitionDetected = false;
+        this._newStreamStarted = false;
+        this._lastStreamTransitionTime = Date.now();
+
+        Log.v(this.TAG, `PTS continuity tracking reset`);
+    }
+
+    /**
+     * Check for conditions that would require a reset of continuity tracking
+     * Should be called periodically
+     */
+    checkForResetConditions() {
+        const now = Date.now();
+        const timeSinceLastTransition = now - this._lastStreamTransitionTime;
+
+        // Reset if it's been a long time since the last transition
+        if (timeSinceLastTransition > this.CONTINUITY_RESET_THRESHOLD) {
+            if (this._streamTransitionDetected) {
+                this._streamTransitionDetected = false;
+
+                if (this.enableDetailedLogging) {
+                    Log.v(this.TAG, `Stream transition resolved, continuity maintained`);
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract PTS from a TS packet
+     *
+     * @param {Uint8Array} packet The MPEG-TS packet
+     * @return {Object|null} Object containing PTS and stream type, or null if not found
+     */
+    extractPTSInfo(packet) {
+        try {
+            // Check if this is the start of PES
+            const payloadStart = (packet[1] & 0x40) !== 0;
+            const hasAdaptationField = (packet[3] & 0x20) !== 0;
+            const hasPayload = (packet[3] & 0x10) !== 0;
+
+            if (!payloadStart || !hasPayload) return null;
+
+            // Calculate payload offset
+            const adaptationFieldLength = hasAdaptationField ? packet[4] : 0;
+            const payloadOffset = hasAdaptationField ? 5 + adaptationFieldLength : 4;
+
+            // Ensure we have enough bytes for a PES header
+            if (packet.length < payloadOffset + 14) return null;
+
+            // Check for PES start code
+            if (packet[payloadOffset] !== 0x00 ||
+                packet[payloadOffset + 1] !== 0x00 ||
+                packet[payloadOffset + 2] !== 0x01) {
+                return null;
+            }
+
+            // Check stream ID to determine type
+            const streamId = packet[payloadOffset + 3];
+            let streamType = null;
+
+            if (streamId >= 0xE0 && streamId <= 0xEF) {
+                streamType = 'video';
+            } else if (streamId >= 0xC0 && streamId <= 0xDF) {
+                streamType = 'audio';
+            } else {
+                return null; // Not a video or audio stream
+            }
+
+            // Check PTS_DTS_flags
+            const ptsDtsFlags = (packet[payloadOffset + 7] & 0xC0) >> 6;
+            if (ptsDtsFlags === 0) return null; // No PTS present
+
+            // Extract PTS
+            const ptsOffset = payloadOffset + 9;
+            const p0 = packet[ptsOffset];
+            const p1 = packet[ptsOffset + 1];
+            const p2 = packet[ptsOffset + 2];
+            const p3 = packet[ptsOffset + 3];
+            const p4 = packet[ptsOffset + 4];
+
+            const pts = (((p0 & 0x0E) << 29) |
+                         ((p1 & 0xFF) << 22) |
+                         ((p2 & 0xFE) << 14) |
+                         ((p3 & 0xFF) << 7) |
+                         ((p4 & 0xFE) >> 1));
+
+            return {
+                pts: pts,
+                streamType: streamType
+            };
+
+        } catch (e) {
+            return null;
+        }
     }
 }
 
