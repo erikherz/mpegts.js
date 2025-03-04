@@ -303,7 +303,7 @@ class PTSContinuityHandler {
  * and improved buffer management for smooth stream transitions
  */
 class WebTransportLoader extends BaseLoader {
-    constructor() {
+   constructor(options = {}) {
         super('webtransport-loader');
         this.TAG = 'WebTransportLoader';
 
@@ -314,17 +314,38 @@ class WebTransportLoader extends BaseLoader {
         this._requestAbort = false;
         this._receivedLength = 0;
 
-        // Configure settings
+        // Configure settings with option overrides
         this.config = {
-            enableDetailedLogging: true,  // Turn on detailed logging for debugging
-            bufferSizeInPackets: 200,     // Reduced from 335 to avoid excessive buffering
-            enablePTSContinuity: true,    // Enable PTS continuity handling
-            initialBufferingThreshold: 0.9, // Fill to 90% before playback starts
-            dispatchChunkSize: 50,        // Number of packets to dispatch at once when buffer exceeds target
-            keyframeAwareChunking: true,  // Ensure chunks start with keyframes
-            maxBufferSize: 600,           // Absolute maximum buffer size to prevent excessive growth
-            forceDispatchThreshold: 400,  // Force dispatch if buffer exceeds this size
-            keyframeDetectionRetries: 3   // Number of keyframe detection methods to try before giving up
+            // Logging
+            enableDetailedLogging: options.enableDetailedLogging !== undefined ? 
+                                  options.enableDetailedLogging : true,
+            
+            // Buffer settings
+            bufferSizeInPackets: options.bufferSizeInPackets || 400,     
+            minBufferSizeInPackets: options.minBufferSizeInPackets || 200, 
+            maxBufferSize: options.maxBufferSize || 1000,                 
+            forceDispatchThreshold: options.forceDispatchThreshold || 600, 
+            
+            // Playback settings
+            enablePTSContinuity: options.enablePTSContinuity !== undefined ? 
+                                options.enablePTSContinuity : true,
+            initialBufferingThreshold: options.initialBufferingThreshold || 0.9,
+            
+            // Dispatch settings
+            dispatchChunkSize: options.dispatchChunkSize || 50,
+            keyframeAwareChunking: options.keyframeAwareChunking !== undefined ? 
+                                 options.keyframeAwareChunking : true,
+            keyframeDetectionRetries: options.keyframeDetectionRetries || 3,
+            
+            // Network adaptation
+            enableNetworkAdaptation: options.enableNetworkAdaptation !== undefined ? 
+                                   options.enableNetworkAdaptation : true,
+            adaptationInterval: options.adaptationInterval || 10000,    // Adapt every 10 seconds
+            
+            // Performance settings
+            enablePerformanceMonitoring: options.enablePerformanceMonitoring !== undefined ?
+                                       options.enablePerformanceMonitoring : true,
+            performanceMonitoringInterval: options.performanceMonitoringInterval || 5000 // Check every 5 seconds
         };
 
         // Packet buffering
@@ -346,9 +367,21 @@ class WebTransportLoader extends BaseLoader {
                 audio: 0
             },
             bufferFullness: 0,
-            maxBufferSize: 0,
+            maxBufferSize: this.config.maxBufferSize,
             keyframesDetected: 0,
-            chunksDispatched: 0
+            chunksDispatched: 0,
+            
+            // Performance metrics
+            dispatchHistory: [],        // Array of dispatch timestamps and sizes
+            networkCondition: 'good',   // 'good', 'variable', or 'poor'
+            avgDispatchRate: 0,         // Average packets per second
+            avgDispatchSize: 0,         // Average dispatch size
+            lastDispatchTime: 0,        // Last dispatch timestamp
+            
+            // Network metrics
+            bytesPerSecond: 0,
+            packetJitter: 0,            // Variability in packet arrival time
+            streamTransitionCount: 0    // Number of stream transitions
         };
 
         // Keyframe tracking
@@ -358,7 +391,12 @@ class WebTransportLoader extends BaseLoader {
         // Initialize PTS continuity handler
         this._ptsHandler = new PTSContinuityHandler();
         this._ptsHandler.enableDetailedLogging = this.config.enableDetailedLogging;
+        
+        // Performance monitoring
+        this._lastPerformanceCheck = Date.now();
+        this._setupPerformanceMonitoring();
     }
+    
 
     static isSupported() {
         try {
@@ -600,162 +638,262 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
-	/**
-	 * Process PTS information in a packet and detect keyframes
-	 *
-	 * @param {Uint8Array} packet MPEG-TS packet
-	 * @param {number} packetIndex Current index in the buffer
-	 * @returns {boolean} True if this packet contains a keyframe
-	 */
-	_processPTSInPacket(packet, packetIndex) {
-	    const ptsInfo = this._ptsHandler.extractPTSInfo(packet);
-	    let isKeyframe = false;
+/**
+ * Dispatches chunks that start with keyframes and include all data up to the next keyframe
+ * Final version with improved buffer management and fallback logic
+ */
+_dispatchKeyframeAwareChunk() {
+    // Get the current number of keyframes detected
+    const numKeyframes = this._keyframePositions.length;
+    
+    // If no keyframes available, scan for keyframes if buffer is large enough
+    if (numKeyframes === 0 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
+        Log.v(this.TAG, `No keyframes detected in buffer of ${this._packetBuffer.length} packets. Forcing keyframe scan.`);
+        this._rescanBufferForKeyframes();
+        
+        // If rescan still finds no keyframes, fallback to non-keyframe aware dispatch
+        if (this._keyframePositions.length === 0) {
+            Log.w(this.TAG, `Still no keyframes after rescan. Falling back to regular dispatch.`);
+            const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
+            this._dispatchPacketChunk(Math.max(excessPackets, 50));
+            return;
+        }
+    }
+    
+    // Standard case: If we have at least two keyframes, dispatch a complete segment
+    if (numKeyframes >= 2) {
+        // Find the keyframe index we should start dispatching from
+        let startKeyframeIndex = 0;
+        
+        // Get the position of the starting keyframe
+        const startPos = this._keyframePositions[startKeyframeIndex];
+        
+        // In most cases, we'll just dispatch from first keyframe to second keyframe
+        const endKeyframeIndex = 1;
+        const endPos = this._keyframePositions[endKeyframeIndex];
+        const packetsToDispatch = endPos - startPos;
+        
+        if (this.config.enableDetailedLogging) {
+            Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
+                 `(${packetsToDispatch} packets), maintaining ${this._packetBuffer.length - endPos} in buffer`);
+        }
+        
+        // Dispatch the segment
+        this._dispatchPacketChunk(endPos);
+        
+        // Update keyframe positions to account for removed packets
+        this._keyframePositions = this._keyframePositions
+            .slice(endKeyframeIndex)
+            .map(pos => pos - endPos)
+            .filter(pos => pos >= 0 && pos < this._packetBuffer.length);
+            
+        return;
+    }
+    
+    // Handle the case where we have only one keyframe:
+    if (numKeyframes === 1) {
+        const keyframePos = this._keyframePositions[0];
+        
+        // If the keyframe is not at the beginning, dispatch data up to the keyframe
+        if (keyframePos > 0) {
+            Log.v(this.TAG, `Dispatching ${keyframePos} packets before keyframe`);
+            this._dispatchPacketChunk(keyframePos);
+            
+            // Update keyframe positions
+            this._keyframePositions[0] = 0;
+            return;
+        }
+        
+        // If we have had only one keyframe for a while, we need to dispatch something
+        // Check if buffer is getting too large
+        if (this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
+            // Determine a safe amount to dispatch (about 1/3 of buffer size or 30 frames worth, whichever is smaller)
+            const safeDispatchAmount = Math.min(
+                Math.floor(this._packetBuffer.length / 3),
+                30 * 20  // Approximately 30 frames worth of packets (assuming 20 packets/frame)
+            );
+            
+            // Ensure we don't dispatch the entire buffer
+            const actualDispatchAmount = Math.min(
+                safeDispatchAmount,
+                Math.max(0, this._packetBuffer.length - this.config.bufferSizeInPackets / 2)
+            );
+            
+            if (actualDispatchAmount > 20) {  // Only dispatch if we have a meaningful amount
+                Log.v(this.TAG, `Single keyframe but growing buffer (${this._packetBuffer.length} packets). ` +
+                      `Dispatching ${actualDispatchAmount} packets.`);
+                
+                this._dispatchPacketChunk(actualDispatchAmount);
+                
+                // Since we dispatched from the beginning and keyframe was at 0,
+                // we need to update keyframe positions
+                this._keyframePositions = [];
+                
+                // Rescan buffer to find new keyframes
+                this._rescanBufferForKeyframes();
+                return;
+            }
+        }
+        
+        if (this.config.enableDetailedLogging) {
+            Log.v(this.TAG, `Only one keyframe in buffer, waiting for next keyframe before dispatching`);
+        }
+        return;
+    }
+    
+    // If we reach here with no keyframes, just wait for more data
+    if (numKeyframes === 0 && this._packetBuffer.length < this.config.bufferSizeInPackets * 1.5) {
+        if (this.config.enableDetailedLogging) {
+            Log.v(this.TAG, `No keyframes detected yet, waiting for keyframes (buffer: ${this._packetBuffer.length} packets)`);
+        }
+    } else if (this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
+        // Buffer is getting too full but no keyframes - dispatch some data anyway
+        const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
+        Log.w(this.TAG, `Buffer full (${this._packetBuffer.length} packets) but no keyframes. ` +
+              `Dispatching ${excessPackets} packets.`);
+        this._dispatchPacketChunk(excessPackets);
+    }
+}
 
-	    // Check for keyframe - enhanced version trying multiple methods
-	    for (let attempt = 0; attempt < this.config.keyframeDetectionRetries; attempt++) {
-		if (attempt === 0) {
-		    isKeyframe = this._isKeyframeByRAI(packet);
-		} else if (attempt === 1) {
-		    isKeyframe = this._isKeyframeByNAL(packet);
-		} else {
-		    isKeyframe = this._isKeyframeByPESHeader(packet);
-		}
-		
-		if (isKeyframe) break;
-	    }
+/**
+ * Process a chunk of MPEG-TS data and manage buffer
+ * 
+ * @param {Uint8Array} chunk The chunk of MPEG-TS data to process
+ */
+_processChunk(chunk) {
+    if (!chunk || chunk.length === 0) return;
 
-	    if (isKeyframe && this.config.keyframeAwareChunking) {
-		this._keyframePositions.push(packetIndex);
-		this.stats.keyframesDetected++;
+    // Extract and validate TS packets
+    for (let i = 0; i < chunk.length; i += this.PACKET_SIZE) {
+        if (i + this.PACKET_SIZE <= chunk.length) {
+            const packet = chunk.slice(i, i + this.PACKET_SIZE);
 
-		if (this.config.enableDetailedLogging && this._keyframePositions.length % 5 === 0) {
-		    Log.v(this.TAG, `Keyframe detected at packet index ${packetIndex}, total keyframes: ${this.stats.keyframesDetected}`);
-		}
-	    }
+            // Basic validation - check sync byte
+            if (packet[0] === 0x47) {
+                // Process PTS information and detect keyframes
+                if (this.config.enablePTSContinuity) {
+                    // Pass current buffer position for keyframe tracking
+                    this._processPTSInPacket(packet, this._packetBuffer.length);
+                }
 
-	    if (ptsInfo) {
-		// Process the PTS value through the continuity handler
-		const adjustedPTS = this._ptsHandler.processPTS(ptsInfo.pts, ptsInfo.streamType);
+                this._packetBuffer.push(packet);
+                this.stats.totalPacketsProcessed++;
 
-		// Update stats
-		if (adjustedPTS !== null) {
-		    this.stats.lastPTS[ptsInfo.streamType] = adjustedPTS;
-		    this.stats.ptsAdjustments[ptsInfo.streamType] = this._ptsHandler._ptsOffsets[ptsInfo.streamType];
-		}
-	    }
+                // Enforce absolute maximum buffer size
+                if (this._packetBuffer.length >= this.config.maxBufferSize) {
+                    Log.w(this.TAG, `Buffer reached maximum size (${this._packetBuffer.length} packets), forcing dispatch`);
 
-	    return isKeyframe;
-	}
+                    // Force dispatch - prefer keyframe-aware if possible
+                    if (this.config.keyframeAwareChunking && this._keyframePositions.length > 1) {
+                        this._dispatchKeyframeAwareChunk();
+                    } else {
+                        // Fallback to regular dispatch
+                        const packetsToDispatch = this._packetBuffer.length - this.config.bufferSizeInPackets;
+                        this._dispatchPacketChunk(Math.max(packetsToDispatch, 50)); // At least 50 packets
+                    }
+                }
+            }
+        }
+    }
 
-	/**
-	 * Dispatches chunks that start with keyframes and include all data up to the next keyframe
-	 */
-	_dispatchKeyframeAwareChunk() {
-	    // Get the current number of keyframes detected
-	    const numKeyframes = this._keyframePositions.length;
-	    
-	    // If no keyframes available, scan for keyframes if buffer is large enough
-	    if (numKeyframes === 0 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
-		Log.v(this.TAG, `No keyframes detected in buffer of ${this._packetBuffer.length} packets. Forcing keyframe scan.`);
-		this._rescanBufferForKeyframes();
-		
-		// If rescan still finds no keyframes, fallback to non-keyframe aware dispatch
-		if (this._keyframePositions.length === 0) {
-		    Log.w(this.TAG, `Still no keyframes after rescan. Falling back to regular dispatch.`);
-		    const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
-		    this._dispatchPacketChunk(Math.max(excessPackets, 50));
-		    return;
-		}
-	    }
-	    
-	    // If only one keyframe and buffer is getting large, dispatch some data anyway
-	    if (numKeyframes <= 1 && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
-		// Two strategies:
-		// 1. If we have at least one keyframe, start dispatching from there
-		if (numKeyframes === 1) {
-		    const keyframePos = this._keyframePositions[0];
-		    // If keyframe is close to the start, dispatch all data from beginning to keyframe
-		    if (keyframePos < 50) {
-			Log.v(this.TAG, `Only one keyframe near start. Dispatching ${keyframePos} packets before keyframe.`);
-			this._dispatchPacketChunk(keyframePos);
-			return;
-		    }
-		    
-		    // If we've waited too long for a second keyframe, dispatch some data after the keyframe
-		    const excessPackets = Math.max(0, this._packetBuffer.length - this.config.bufferSizeInPackets);
-		    if (excessPackets > 100) {
-			// Determine a safe amount to dispatch (typically around 1 second of video)
-			// Assuming 5 Mbps video = approximately 3500 bytes/frame at 30fps = ~19 packets per frame
-			const safeDispatchAmount = Math.min(keyframePos + 30*19, this._packetBuffer.length / 2);
-			
-			Log.v(this.TAG, `Single keyframe but large buffer. Dispatching ${safeDispatchAmount} packets.`);
-			this._dispatchPacketChunk(safeDispatchAmount);
-			
-			// Update keyframe position
-			this._keyframePositions = this._keyframePositions
-			    .map(pos => pos - safeDispatchAmount)
-			    .filter(pos => pos >= 0);
-			
-			return;
-		    }
-		} 
-		// 2. If we have no keyframes, just dispatch some data to prevent buffer overflow
-		else {
-		    // Calculate a conservative amount to dispatch
-		    const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
-		    
-		    if (excessPackets > 50) {
-			Log.w(this.TAG, `No keyframes but buffer growing (${this._packetBuffer.length} packets). Dispatching ${excessPackets} packets.`);
-			this._dispatchPacketChunk(excessPackets);
-			return;
-		    }
-		}
-	    }
+    // Update buffer fullness stats
+    this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
 
-	    // Standard case: If we have at least two keyframes, we can dispatch a complete segment
-	    if (numKeyframes >= 2) {
-		// Find the keyframe index we should start dispatching from
-		let startKeyframeIndex = 0;
-		
-		// Get the position of the starting keyframe
-		const startPos = this._keyframePositions[startKeyframeIndex];
-		
-		// In most cases, we'll just dispatch from first keyframe to second keyframe
-		const endKeyframeIndex = 1;
-		const endPos = this._keyframePositions[endKeyframeIndex];
-		const packetsToDispatch = endPos - startPos;
-		
-		if (this.config.enableDetailedLogging) {
-		    Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
-			 `(${packetsToDispatch} packets), maintaining ${this._packetBuffer.length - endPos} in buffer`);
-		}
-		
-		// Dispatch the segment
-		this._dispatchPacketChunk(endPos);
-		
-		// Update keyframe positions to account for removed packets
-		this._keyframePositions = this._keyframePositions
-		    .slice(endKeyframeIndex)
-		    .map(pos => pos - endPos)
-		    .filter(pos => pos >= 0 && pos < this._packetBuffer.length);
-		    
-		return;
-	    }
-	    
-	    // If we reach here with one keyframe but not enough buffer to force dispatch
-	    if (numKeyframes === 1) {
-		if (this.config.enableDetailedLogging) {
-		    Log.v(this.TAG, `Only one keyframe in buffer, waiting for next keyframe before dispatching`);
-		}
-	    }
-	    
-	    // If we reach here with no keyframes, just wait for more data
-	    if (numKeyframes === 0 && this._packetBuffer.length < this.config.bufferSizeInPackets * 1.5) {
-		if (this.config.enableDetailedLogging) {
-		    Log.v(this.TAG, `No keyframes detected yet, waiting for keyframes (buffer: ${this._packetBuffer.length} packets)`);
-		}
-	    }
-	}
+    // Check if initial buffering is complete
+    if (!this._initialBufferingComplete) {
+        // Only start playback when buffer is filled to the specified threshold
+        // AND we have at least one keyframe in the buffer
+        if (this.stats.bufferFullness >= this.config.initialBufferingThreshold &&
+            (!this.config.keyframeAwareChunking || this._keyframePositions.length > 0)) {
+
+            this._initialBufferingComplete = true;
+            this._status = LoaderStatus.kComplete;
+            Log.v(this.TAG, `Initial buffering complete: ${Math.round(this.stats.bufferFullness * 100)}% full with ${this._keyframePositions.length} keyframes`);
+        } else {
+            // Still in initial buffering phase
+            return; // Don't dispatch packets yet
+        }
+    }
+
+    // If keyframe detection is enabled but we don't have any keyframes yet,
+    // perform a scan when buffer reaches a certain size
+    if (this.config.keyframeAwareChunking && 
+        this._keyframePositions.length === 0 && 
+        this._packetBuffer.length > 100) {
+        this._rescanBufferForKeyframes();
+    }
+
+    // Enhanced dispatch logic with forced dispatch for overly full buffers
+    if (this._packetBuffer.length > this.config.forceDispatchThreshold) {
+        // Buffer is extremely full, force dispatch
+        Log.w(this.TAG, `Buffer exceeding force threshold (${this._packetBuffer.length}/${this.config.forceDispatchThreshold}), forcing dispatch`);
+
+        if (this.config.keyframeAwareChunking && this._keyframePositions.length > 1) {
+            this._dispatchKeyframeAwareChunk();
+        } else {
+            // Fallback to regular dispatch
+            const packetsToDispatch = this._packetBuffer.length - this.config.bufferSizeInPackets;
+            this._dispatchPacketChunk(Math.max(packetsToDispatch, 50)); // At least 50 packets
+        }
+    }
+    // Normal dispatch logic - only if buffer exceeds target size
+    else if (this._packetBuffer.length > this.config.bufferSizeInPackets) {
+        if (this.config.keyframeAwareChunking) {
+            this._dispatchKeyframeAwareChunk();
+        } else {
+            // Original excess-based dispatch
+            const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
+            const packetsToDispatch = Math.min(excessPackets, this.config.dispatchChunkSize);
+
+            if (this.config.enableDetailedLogging) {
+                Log.v(this.TAG, `Buffer exceeds target (${this._packetBuffer.length}/${this.config.bufferSizeInPackets}), dispatching ${packetsToDispatch} packets`);
+            }
+
+            this._dispatchPacketChunk(packetsToDispatch);
+        }
+    }
+}
+
+/**
+ * Process PTS information in a packet and detect keyframes
+ * Enhanced with more aggressive keyframe detection methods
+ *
+ * @param {Uint8Array} packet MPEG-TS packet
+ * @param {number} packetIndex Current index in the buffer
+ * @returns {boolean} True if this packet contains a keyframe
+ */
+_processPTSInPacket(packet, packetIndex) {
+    const ptsInfo = this._ptsHandler.extractPTSInfo(packet);
+    let isKeyframe = false;
+
+    // Check for keyframe using multiple methods
+    isKeyframe = this._isKeyframeByRAI(packet) || 
+                this._isKeyframeByNAL(packet) || 
+                this._isKeyframeByPESHeader(packet);
+
+    if (isKeyframe && this.config.keyframeAwareChunking) {
+        this._keyframePositions.push(packetIndex);
+        this.stats.keyframesDetected++;
+
+        if (this.config.enableDetailedLogging && 
+            (this._keyframePositions.length <= 5 || this._keyframePositions.length % 5 === 0)) {
+            Log.v(this.TAG, `Keyframe detected at packet index ${packetIndex}, total keyframes: ${this.stats.keyframesDetected}`);
+        }
+    }
+
+    if (ptsInfo) {
+        // Process the PTS value through the continuity handler
+        const adjustedPTS = this._ptsHandler.processPTS(ptsInfo.pts, ptsInfo.streamType);
+
+        // Update stats
+        if (adjustedPTS !== null) {
+            this.stats.lastPTS[ptsInfo.streamType] = adjustedPTS;
+            this.stats.ptsAdjustments[ptsInfo.streamType] = this._ptsHandler._ptsOffsets[ptsInfo.streamType];
+        }
+    }
+
+    return isKeyframe;
+}
 
 	/**
 	 * Significantly enhanced keyframe detection that is more aggressive about finding keyframes
@@ -1134,92 +1272,6 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
-    _processChunk(chunk) {
-        if (!chunk || chunk.length === 0) return;
-
-        // Extract and validate TS packets
-        for (let i = 0; i < chunk.length; i += this.PACKET_SIZE) {
-            if (i + this.PACKET_SIZE <= chunk.length) {
-                const packet = chunk.slice(i, i + this.PACKET_SIZE);
-
-                // Basic validation - check sync byte
-                if (packet[0] === 0x47) {
-                    // Process PTS information and detect keyframes
-                    if (this.config.enablePTSContinuity) {
-                        // Pass current buffer position for keyframe tracking
-                        this._processPTSInPacket(packet, this._packetBuffer.length);
-                    }
-
-                    this._packetBuffer.push(packet);
-                    this.stats.totalPacketsProcessed++;
-
-                    // Enforce absolute maximum buffer size
-                    if (this._packetBuffer.length >= this.config.maxBufferSize) {
-                        Log.w(this.TAG, `Buffer reached maximum size (${this._packetBuffer.length} packets), forcing dispatch`);
-
-                        // Force dispatch - prefer keyframe-aware if possible
-                        if (this.config.keyframeAwareChunking && this._keyframePositions.length > 1) {
-                            this._dispatchKeyframeAwareChunk();
-                        } else {
-                            // Fallback to regular dispatch
-                            const packetsToDispatch = this._packetBuffer.length - this.config.bufferSizeInPackets;
-                            this._dispatchPacketChunk(Math.max(packetsToDispatch, 50)); // At least 50 packets
-                        }
-                    }
-                }
-            }
-        }
-
-        // Update buffer fullness stats
-        this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
-
-        // Check if initial buffering is complete
-        if (!this._initialBufferingComplete) {
-            // Only start playback when buffer is filled to the specified threshold
-            // AND we have at least one keyframe in the buffer
-            if (this.stats.bufferFullness >= this.config.initialBufferingThreshold &&
-                (!this.config.keyframeAwareChunking || this._keyframePositions.length > 0)) {
-
-                this._initialBufferingComplete = true;
-                this._status = LoaderStatus.kComplete;
-                Log.v(this.TAG, `Initial buffering complete: ${Math.round(this.stats.bufferFullness * 100)}% full with ${this._keyframePositions.length} keyframes`);
-            } else {
-                // Still in initial buffering phase
-                return; // Don't dispatch packets yet
-            }
-        }
-
-        // Enhanced dispatch logic with forced dispatch for overly full buffers
-        if (this._packetBuffer.length > this.config.forceDispatchThreshold) {
-            // Buffer is extremely full, force dispatch
-            Log.w(this.TAG, `Buffer exceeding force threshold (${this._packetBuffer.length}/${this.config.forceDispatchThreshold}), forcing dispatch`);
-
-            if (this.config.keyframeAwareChunking && this._keyframePositions.length > 1) {
-                this._dispatchKeyframeAwareChunk();
-            } else {
-                // Fallback to regular dispatch
-                const packetsToDispatch = this._packetBuffer.length - this.config.bufferSizeInPackets;
-                this._dispatchPacketChunk(Math.max(packetsToDispatch, 50)); // At least 50 packets
-            }
-        }
-        // Normal dispatch logic - only if buffer exceeds target size
-        else if (this._packetBuffer.length > this.config.bufferSizeInPackets) {
-            if (this.config.keyframeAwareChunking) {
-                this._dispatchKeyframeAwareChunk();
-            } else {
-                // Original excess-based dispatch
-                const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
-                const packetsToDispatch = Math.min(excessPackets, this.config.dispatchChunkSize);
-
-                if (this.config.enableDetailedLogging) {
-                    Log.v(this.TAG, `Buffer exceeds target (${this._packetBuffer.length}/${this.config.bufferSizeInPackets}), dispatching ${packetsToDispatch} packets`);
-                }
-
-                this._dispatchPacketChunk(packetsToDispatch);
-            }
-        }
-    }
-
     /**
      * Determines if a packet contains a keyframe (IDR frame)
      *
@@ -1327,47 +1379,6 @@ class WebTransportLoader extends BaseLoader {
             Log.w(this.TAG, `Error detecting keyframe: ${e.message}`);
             return false;
         }
-    }
-
-    /**
-     * Dispatch a specific number of packets from the buffer
-     *
-     * @param {number} packetCount Number of packets to dispatch
-     */
-    _dispatchPacketChunk(packetCount) {
-        if (this._packetBuffer.length === 0 || packetCount <= 0) return;
-
-        // Limit to available packets
-        const actualPacketsToDispatch = Math.min(packetCount, this._packetBuffer.length);
-
-        // Get packets to dispatch
-        const packetsToDispatch = this._packetBuffer.slice(0, actualPacketsToDispatch);
-
-        // Remove those packets from the buffer
-        this._packetBuffer = this._packetBuffer.slice(actualPacketsToDispatch);
-
-        // Combine packets into a single chunk
-        const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
-        const chunk = new Uint8Array(totalLength);
-
-        let offset = 0;
-        packetsToDispatch.forEach(packet => {
-            chunk.set(packet, offset);
-            offset += packet.length;
-        });
-
-        // Log dispatch details if detailed logging is enabled
-        if (this.config.enableDetailedLogging) {
-            Log.v(this.TAG, `Dispatching ${actualPacketsToDispatch} packets (${(totalLength / 1024).toFixed(1)} KB), remaining buffer: ${this._packetBuffer.length} packets`);
-        }
-
-        // Send to demuxer
-        if (this._onDataArrival) {
-            this._onDataArrival(chunk.buffer, 0, totalLength);
-        }
-
-        // Update stats after dispatch
-        this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
     }
 
     async abort() {
@@ -1523,29 +1534,216 @@ class WebTransportLoader extends BaseLoader {
         this.stats.keyframesDetected = 0;
     }
 
+}
+
+   /**
+     * Set up performance monitoring for adaptive buffer management
+     */
+    _setupPerformanceMonitoring() {
+        if (!this.config.enablePerformanceMonitoring) return;
+
+        this._performanceMonitorTimer = setInterval(() => {
+            this._evaluatePerformance();
+        }, this.config.performanceMonitoringInterval);
+    }
+
+    /**
+     * Evaluate playback performance and adjust buffer sizes if needed
+     */
+    _evaluatePerformance() {
+        if (!this.config.enableNetworkAdaptation) return;
+
+        const now = Date.now();
+        const timeSinceLastCheck = now - this._lastPerformanceCheck;
+        this._lastPerformanceCheck = now;
+
+        // Calculate bytes per second
+        if (timeSinceLastCheck > 0) {
+            this.stats.bytesPerSecond = (this._receivedLength / timeSinceLastCheck) * 1000;
+        }
+
+        // Analyze dispatch history
+        if (this.stats.dispatchHistory.length > 5) {
+            // Calculate average dispatch interval
+            let totalInterval = 0;
+            let intervalCount = 0;
+            let intervals = [];
+
+            for (let i = 1; i < this.stats.dispatchHistory.length; i++) {
+                const interval = this.stats.dispatchHistory[i].time - this.stats.dispatchHistory[i-1].time;
+                if (interval > 0) {
+                    totalInterval += interval;
+                    intervals.push(interval);
+                    intervalCount++;
+                }
+            }
+
+            // Calculate jitter (standard deviation of intervals)
+            if (intervalCount > 3) {
+                const avgInterval = totalInterval / intervalCount;
+                let sumSquaredDiff = 0;
+
+                for (let interval of intervals) {
+                    sumSquaredDiff += Math.pow(interval - avgInterval, 2);
+                }
+
+                this.stats.packetJitter = Math.sqrt(sumSquaredDiff / intervalCount);
+
+                // Determine network condition
+                if (this.stats.packetJitter > 500) { // High jitter
+                    this.stats.networkCondition = 'poor';
+                } else if (this.stats.packetJitter > 200) {
+                    this.stats.networkCondition = 'variable';
+                } else {
+                    this.stats.networkCondition = 'good';
+                }
+
+                // Adjust buffer size based on network condition
+                this._adjustBufferSize();
+            }
+
+            // Keep history limited
+            if (this.stats.dispatchHistory.length > 20) {
+                this.stats.dispatchHistory = this.stats.dispatchHistory.slice(-20);
+            }
+        }
+    }
+
+    /**
+     * Adjust buffer size based on network conditions and playback performance
+     */
+    _adjustBufferSize() {
+        const currentSize = this.config.bufferSizeInPackets;
+        let newSize = currentSize;
+
+        switch (this.stats.networkCondition) {
+            case 'poor':
+                // Increase buffer for poor conditions
+                newSize = Math.min(this.config.maxBufferSize, currentSize * 1.5);
+                break;
+
+            case 'variable':
+                // Moderately increase buffer
+                newSize = Math.min(this.config.maxBufferSize, currentSize * 1.2);
+                break;
+
+            case 'good':
+                // Slightly reduce buffer if it's very large
+                if (currentSize > this.config.minBufferSizeInPackets * 2) {
+                    newSize = Math.max(this.config.minBufferSizeInPackets, currentSize * 0.9);
+                }
+                break;
+        }
+
+        // Only update if the change is significant (greater than 10%)
+        if (Math.abs(newSize - currentSize) / currentSize > 0.1) {
+            this.adjustBufferSize(Math.round(newSize));
+        }
+    }
+
     /**
      * Adjusts the buffer size based on network conditions or playback requirements
      *
      * @param {number} newSizeInPackets New buffer size in packets
      */
     adjustBufferSize(newSizeInPackets) {
-        if (newSizeInPackets < 100) {
-            Log.w(this.TAG, `Buffer size too small (${newSizeInPackets}), using minimum of 100 packets`);
-            newSizeInPackets = 100;
+        // Ensure buffer size is within bounds
+        newSizeInPackets = Math.max(this.config.minBufferSizeInPackets,
+                            Math.min(this.config.maxBufferSize, newSizeInPackets));
+
+        if (newSizeInPackets === this.config.bufferSizeInPackets) {
+            return; // No change needed
         }
 
         const oldSize = this.config.bufferSizeInPackets;
         this.config.bufferSizeInPackets = newSizeInPackets;
-        this.stats.maxBufferSize = newSizeInPackets;
+
+        // Adjust related thresholds
+        this.config.forceDispatchThreshold = Math.min(
+            this.config.maxBufferSize - 200,
+            Math.max(this.config.bufferSizeInPackets + 200, this.config.forceDispatchThreshold)
+        );
+
         this.stats.bufferFullness = this._packetBuffer.length / newSizeInPackets;
 
         Log.v(this.TAG, `Buffer size adjusted from ${oldSize} to ${newSizeInPackets} packets`);
+        Log.v(this.TAG, `Force dispatch threshold adjusted to ${this.config.forceDispatchThreshold} packets`);
 
         // If buffer is now too large, dispatch excess packets
         if (this._packetBuffer.length > newSizeInPackets && this._initialBufferingComplete) {
             const excess = this._packetBuffer.length - newSizeInPackets;
             this._dispatchPacketChunk(excess);
         }
+    }
+
+    /**
+     * Record a dispatch event for performance monitoring
+     *
+     * @param {number} packetCount Number of packets dispatched
+     */
+    _recordDispatch(packetCount) {
+        if (!this.config.enablePerformanceMonitoring) return;
+
+        const now = Date.now();
+        this.stats.dispatchHistory.push({
+            time: now,
+            packets: packetCount
+        });
+
+        this.stats.lastDispatchTime = now;
+        this.stats.chunksDispatched++;
+
+        // Update average dispatch size
+        const totalDispatches = this.stats.dispatchHistory.length;
+        if (totalDispatches > 0) {
+            let totalPackets = 0;
+            for (let dispatch of this.stats.dispatchHistory) {
+                totalPackets += dispatch.packets;
+            }
+            this.stats.avgDispatchSize = totalPackets / totalDispatches;
+        }
+    }
+
+    /**
+     * Dispatch a specific number of packets from the buffer
+     *
+     * @param {number} packetCount Number of packets to dispatch
+     */
+    _dispatchPacketChunk(packetCount) {
+        if (this._packetBuffer.length === 0 || packetCount <= 0) return;
+
+        // Limit to available packets
+        const actualPacketsToDispatch = Math.min(packetCount, this._packetBuffer.length);
+
+        // Get packets to dispatch
+        const packetsToDispatch = this._packetBuffer.slice(0, actualPacketsToDispatch);
+
+        // Remove those packets from the buffer
+        this._packetBuffer = this._packetBuffer.slice(actualPacketsToDispatch);
+
+        // Combine packets into a single chunk
+        const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
+        const chunk = new Uint8Array(totalLength);
+
+        let offset = 0;
+        packetsToDispatch.forEach(packet => {
+            chunk.set(packet, offset);
+            offset += packet.length;
+        });
+
+        // Log dispatch details if detailed logging is enabled
+        if (this.config.enableDetailedLogging) {
+            Log.v(this.TAG, `Dispatching ${actualPacketsToDispatch} packets (${(totalLength / 1024).toFixed(1)} KB), remaining buffer: ${this._packetBuffer.length} packets`);
+        }
+
+        // Send to demuxer
+        if (this._onDataArrival) {
+            this._onDataArrival(chunk.buffer, 0, totalLength);
+        }
+
+        // Update stats after dispatch
+        this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
+        this._recordDispatch(actualPacketsToDispatch);
     }
 }
 
