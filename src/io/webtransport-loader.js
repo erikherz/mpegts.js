@@ -16,41 +16,55 @@
 
 import Log from '../utils/logger.js';
 import {BaseLoader, LoaderStatus, LoaderErrors} from './loader.js';
-import {RuntimeException} from '../utils/exception.js';
 
+/**
+ * WebTransportLoader - Loads MPEG-TS data over WebTransport connection
+ */
 class WebTransportLoader extends BaseLoader {
     constructor() {
         super('webtransport-loader');
         this.TAG = 'WebTransportLoader';
 
-        // Basic properties
+        this._needStash = true;
         this._transport = null;
         this._streamReader = null;  // For reading incoming streams
         this._currentStreamReader = null;  // For reading current active stream
         this._requestAbort = false;
         this._receivedLength = 0;
 
-        // Buffer for MPEG-TS packets
+        // Configure settings
+        this.config = {
+            enableDetailedLogging: false,
+            packetFlushThreshold: 100  // Number of packets per chunk
+        };
+
+        // Packet buffering
         this.PACKET_SIZE = 188;
-        this.PACKETS_PER_CHUNK = 100;
         this._packetBuffer = [];
 
-        // Diagnostic stats
+        // Diagnostics
         this.stats = {
             totalBytesReceived: 0,
             totalPacketsProcessed: 0,
             streamsReceived: 0,
-            streamTasks: [],
             lastPTS: null
         };
     }
 
     static isSupported() {
-        return typeof self.WebTransport !== 'undefined';
+        try {
+            return typeof self.WebTransport !== 'undefined';
+        } catch (e) {
+            return false;
+        }
     }
 
     async open(dataSource) {
         try {
+            if (!dataSource.url.startsWith('https://')) {
+                throw new Error('WebTransport requires HTTPS URL');
+            }
+
             Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
 
             // Create WebTransport connection
@@ -112,18 +126,14 @@ class WebTransportLoader extends BaseLoader {
                 this.stats.streamsReceived++;
                 Log.v(this.TAG, `Received stream #${this.stats.streamsReceived}, processing...`);
 
-                // Process this stream
+                // Process this stream until it's done
                 this._currentStreamReader = stream.getReader();
+                await this._readStreamData(this._currentStreamReader);
+            }
 
-                // Create a task for this stream and don't wait for it
-                const streamTask = this._readStreamData(this._currentStreamReader)
-                    .catch(error => {
-                        if (!this._requestAbort) {
-                            Log.e(this.TAG, `Error reading stream: ${error.message}`);
-                        }
-                    });
-
-                this.stats.streamTasks.push(streamTask);
+            // Final flush of any remaining packets
+            if (this._packetBuffer.length > 0 && !this._requestAbort) {
+                this._dispatchPacketChunk();
             }
 
             Log.v(this.TAG, "Stream processing loop ended");
@@ -156,11 +166,11 @@ class WebTransportLoader extends BaseLoader {
                     }
 
                     // Force flush any remaining packets
-                    if (this._packetBuffer.length > 0) {
+                    if (this._packetBuffer.length > 0 && !this._requestAbort) {
                         this._dispatchPacketChunk();
                     }
 
-                    break;
+                    return; // Stream is done
                 }
 
                 if (value) {
@@ -208,7 +218,6 @@ class WebTransportLoader extends BaseLoader {
         } catch (e) {
             if (!this._requestAbort) {
                 Log.e(this.TAG, `Error in _readStreamData: ${e.message}`);
-                throw e;  // Re-throw to be caught by the caller
             }
         }
     }
@@ -252,8 +261,8 @@ class WebTransportLoader extends BaseLoader {
             if (i + this.PACKET_SIZE <= chunk.length) {
                 const packet = chunk.slice(i, i + this.PACKET_SIZE);
 
-                // Basic validation
-                if (packet[0] === 0x47) {  // Check sync byte
+                // Basic validation - check sync byte
+                if (packet[0] === 0x47) {
                     this._packetBuffer.push(packet);
                     this.stats.totalPacketsProcessed++;
 
@@ -264,7 +273,7 @@ class WebTransportLoader extends BaseLoader {
         }
 
         // If we have enough packets, dispatch them
-        if (this._packetBuffer.length >= this.PACKETS_PER_CHUNK) {
+        if (this._packetBuffer.length >= this.config.packetFlushThreshold) {
             this._dispatchPacketChunk();
         }
     }
@@ -273,12 +282,14 @@ class WebTransportLoader extends BaseLoader {
         if (this._packetBuffer.length === 0) return;
 
         // Combine packets into a single chunk
-        const totalLength = this._packetBuffer.length * this.PACKET_SIZE;
+        const totalLength = this._packetBuffer.reduce((sum, packet) => sum + packet.length, 0);
         const chunk = new Uint8Array(totalLength);
 
-        for (let i = 0; i < this._packetBuffer.length; i++) {
-            chunk.set(this._packetBuffer[i], i * this.PACKET_SIZE);
-        }
+        let offset = 0;
+        this._packetBuffer.forEach(packet => {
+            chunk.set(packet, offset);
+            offset += packet.length;
+        });
 
         // Send to demuxer
         if (this._onDataArrival) {
@@ -291,8 +302,7 @@ class WebTransportLoader extends BaseLoader {
 
     _tryExtractPTS(packet) {
         try {
-            // This is a simplified PTS extraction for diagnostics
-            // Real implementation should be more robust
+            // This is a simplified PTS extraction for diagnostics only
 
             // Check if this is the start of PES
             const payloadStart = (packet[1] & 0x40) !== 0;
