@@ -449,37 +449,6 @@ class StreamRotationHandler {
     }
 }
 
-class MPEGTSTestHarness {
-    constructor(options = {}) {
-        this.TAG = 'MPEGTSTestHarness';
-        this.onLog = options.onLog || console.log;
-    }
-
-    reset() {
-        this.onLog(`${this.TAG}: Test harness reset complete`);
-    }
-
-    integrateWithLoader(loader) {
-        // Save the original dispatch method
-        const originalDispatchMethod = loader._dispatchPacketChunk.bind(loader);
-
-        // Override the dispatch method
-        loader._dispatchPacketChunk = () => {
-            if (loader._packetBuffer.length === 0) return;
-            // Call the original method
-            originalDispatchMethod();
-        };
-
-        this.onLog(`${this.TAG}: Test harness integrated with loader`);
-    }
-
-    generateReport() {
-        return {
-            message: "Test harness disabled but stub methods provided for compatibility"
-        };
-    }
-}
-
 /**
  * TS Packet Validator - checks for valid MPEG-TS packet structure
  */
@@ -860,238 +829,6 @@ class PacketLogger {
     }
 }
 
-/**
- * MPEGTSTestHarness - Class for monitoring and testing MPEG-TS stream health
- */
-class MPEGTSTestHarness {
-    constructor(options = {}) {
-        this.TAG = 'MPEGTSTestHarness';
-        this.onLog = options.onLog || (() => {});
-
-        // Metrics tracking
-        this.metrics = {
-            packetsReceived: 0,
-            syncLossCount: 0,
-            ccErrorCount: 0,
-            ptsJumpCount: 0,
-            streamSwitches: 0,
-            lastPTSValue: null,
-            ptsTimestamps: [],
-            packetGaps: []
-        };
-
-        // Reference to the loader
-        this.loader = null;
-
-        // Sampling rate
-        this.sampleRate = options.sampleRate || 20; // 1 in X packets
-        this.maxSampleHistory = options.maxSampleHistory || 100;
-    }
-
-    reset() {
-        this.metrics = {
-            packetsReceived: 0,
-            syncLossCount: 0,
-            ccErrorCount: 0,
-            ptsJumpCount: 0,
-            streamSwitches: 0,
-            lastPTSValue: null,
-            ptsTimestamps: [],
-            packetGaps: []
-        };
-
-        this.onLog('Test harness reset complete');
-    }
-
-    integrateWithLoader(loader) {
-        this.loader = loader;
-        this.onLog('Test harness integrated with loader');
-    }
-
-    recordPacketReceived(packet, timestamp) {
-        this.metrics.packetsReceived++;
-
-        // Sample only a portion of packets for performance
-        if (this.metrics.packetsReceived % this.sampleRate !== 0) {
-            return;
-        }
-
-        // Check for sync byte
-        if (packet[0] !== 0x47) {
-            this.metrics.syncLossCount++;
-        }
-
-        // Extract PID and continuity counter
-        const pid = ((packet[1] & 0x1F) << 8) | packet[2];
-        const cc = packet[3] & 0x0F;
-
-        // Record timestamp if it's a video packet with PTS
-        this._extractAndRecordPTS(packet, timestamp);
-    }
-
-    _extractAndRecordPTS(packet, timestamp) {
-        // Extract PTS (simplified implementation)
-        try {
-            const payloadStart = (packet[1] & 0x40) !== 0;
-            const hasAdaptationField = (packet[3] & 0x20) !== 0;
-            const hasPayload = (packet[3] & 0x10) !== 0;
-
-            if (!payloadStart || !hasPayload) {
-                return;
-            }
-
-            // Calculate payload offset
-            const payloadOffset = hasAdaptationField ?
-                (5 + packet[4]) : 4;
-
-            // Ensure we have enough bytes for a PES header
-            if (packet.length < payloadOffset + 14) {
-                return;
-            }
-
-            // Check for PES start code (0x000001)
-            if (packet[payloadOffset] !== 0x00 ||
-                packet[payloadOffset + 1] !== 0x00 ||
-                packet[payloadOffset + 2] !== 0x01) {
-                return;
-            }
-
-            // Check stream ID for video
-            const streamId = packet[payloadOffset + 3];
-            if (streamId < 0xE0 || streamId > 0xEF) {
-                return; // Not video
-            }
-
-            // Check PTS_DTS_flags
-            const ptsDtsFlags = (packet[payloadOffset + 7] & 0xC0) >> 6;
-            if (ptsDtsFlags === 0) {
-                return; // No PTS present
-            }
-
-            // Extract PTS (33-bit value spread across 5 bytes)
-            const p0 = packet[payloadOffset + 9];
-            const p1 = packet[payloadOffset + 10];
-            const p2 = packet[payloadOffset + 11];
-            const p3 = packet[payloadOffset + 12];
-            const p4 = packet[payloadOffset + 13];
-
-            // Combine the bytes according to MPEG-TS spec
-            const pts = (((p0 >> 1) & 0x07) << 30) |
-                       (p1 << 22) |
-                       (((p2 >> 1) & 0x7F) << 15) |
-                       (p3 << 7) |
-                       ((p4 >> 1) & 0x7F);
-
-            // Check for PTS jumps
-            if (this.metrics.lastPTSValue !== null) {
-                const ptsDiff = Math.abs(pts - this.metrics.lastPTSValue);
-                // Check for unexpected jumps (over 45000 in 90kHz clock is ~0.5 sec)
-                if (ptsDiff > 45000 && ptsDiff < 8589934592) { // Ignore wraparound
-                    this.metrics.ptsJumpCount++;
-                }
-            }
-
-            this.metrics.lastPTSValue = pts;
-
-            // Record PTS with timestamp
-            this.metrics.ptsTimestamps.push({
-                pts: pts,
-                timestamp: timestamp
-            });
-
-            // Keep history within bounds
-            if (this.metrics.ptsTimestamps.length > this.maxSampleHistory) {
-                this.metrics.ptsTimestamps.shift();
-            }
-
-        } catch (e) {
-            // Silently ignore extraction errors
-        }
-    }
-
-    recordStreamSwitch() {
-        this.metrics.streamSwitches++;
-    }
-
-    generateReport() {
-        // Calculate stream health indicators
-        let ptsJitterMs = 0;
-        let bitrateBps = 0;
-        let streamSwitchRate = 0;
-
-        // Calculate PTS jitter if we have enough samples
-        if (this.metrics.ptsTimestamps.length > 5) {
-            try {
-                // Measure PTS vs wall clock consistency
-                const ptsRatios = [];
-                for (let i = 1; i < this.metrics.ptsTimestamps.length; i++) {
-                    const curr = this.metrics.ptsTimestamps[i];
-                    const prev = this.metrics.ptsTimestamps[i-1];
-
-                    const ptsDiff = (curr.pts - prev.pts) & 0x1FFFFFFFF; // Handle 33-bit wraparound
-                    const timeDiff = curr.timestamp - prev.timestamp;
-
-                    if (timeDiff > 0) {
-                        // PTS is in 90kHz clock, convert to ms
-                        const expectedTime = ptsDiff / 90; // ms
-                        const ratio = expectedTime / timeDiff;
-                        ptsRatios.push(ratio);
-                    }
-                }
-
-                // Calculate average and standard deviation
-                if (ptsRatios.length > 0) {
-                    const avgRatio = ptsRatios.reduce((a, b) => a + b, 0) / ptsRatios.length;
-                    const variance = ptsRatios.reduce((a, b) => a + Math.pow(b - avgRatio, 2), 0) / ptsRatios.length;
-                    ptsJitterMs = Math.sqrt(variance) * 100; // Convert to ms scale
-                }
-            } catch (e) {
-                this.onLog(`Error calculating jitter: ${e.message}`);
-            }
-        }
-
-        // Get additional metrics from loader if available
-        let rotationStats = {};
-        let streamCount = 0;
-
-        if (this.loader) {
-            if (typeof this.loader.getStreamHealthReport === 'function') {
-                try {
-                    const healthReport = this.loader.getStreamHealthReport();
-                    rotationStats = healthReport.rotationStats || {};
-                    streamCount = healthReport.streamCount || 0;
-
-                    // Calculate bitrate from bytes received if possible
-                    if (healthReport.receivedBytes &&
-                        this.metrics.ptsTimestamps.length >= 2) {
-                        const firstTs = this.metrics.ptsTimestamps[0].timestamp;
-                        const lastTs = this.metrics.ptsTimestamps[this.metrics.ptsTimestamps.length - 1].timestamp;
-                        const durationSec = (lastTs - firstTs) / 1000;
-
-                        if (durationSec > 0) {
-                            bitrateBps = Math.round((healthReport.receivedBytes * 8) / durationSec);
-                        }
-                    }
-                } catch (e) {
-                    this.onLog(`Error getting loader health report: ${e.message}`);
-                }
-            }
-        }
-
-        return {
-            packetsReceived: this.metrics.packetsReceived,
-            syncLossRate: this.metrics.packetsReceived > 0 ?
-                (this.metrics.syncLossCount / this.metrics.packetsReceived) : 0,
-            ptsJumpCount: this.metrics.ptsJumpCount,
-            streamSwitches: this.metrics.streamSwitches,
-            estimatedBitrate: bitrateBps,
-            ptsJitterMs: ptsJitterMs,
-            activeStreamCount: streamCount,
-            ...rotationStats
-        };
-    }
-}
-
 class WebTransportLoader extends BaseLoader {
 constructor() {
     super('webtransport-loader');
@@ -1143,10 +880,6 @@ constructor() {
     
     // Bind core methods only
     this._readChunks = this._readChunks.bind(this);
-    this._getNextStream = this._getNextStream.bind(this);
-    this._processPackets = this._processPackets.bind(this);
-    this._dispatchPacketChunk = this._dispatchPacketChunk.bind(this);
-    this.advancedStreamDiagnosis = this.advancedStreamDiagnosis.bind(this);
 }
 
 _readChunks() {
@@ -1208,10 +941,6 @@ _readChunks() {
                         var validLength = Math.floor(pendingData.length / 188) * 188;
                         var validChunk = pendingData.slice(0, validLength);
                         var packets = _this.tsBuffer.addChunk(validChunk);
-
-                        if (packets) {
-                            _this._processPackets(packets);
-                        }
                     }
 
                     // Clear pending data for the new stream
@@ -1255,10 +984,6 @@ _readChunks() {
                     if (validLength > 0) {
                         var validChunk = chunk.slice(0, validLength);
                         var packets = _this.tsBuffer.addChunk(validChunk);
-
-                        if (packets) {
-                            _this._processPackets(packets);
-                        }
                     }
 
                     // Store remainder for next iteration
@@ -1323,7 +1048,6 @@ _readChunks() {
         function cleanup() {
             // Flush any remaining packets
             if (_this._packetBuffer.length > 0 && !_this._requestAbort) {
-                _this._dispatchPacketChunk();
             }
 
             // Cleanup
@@ -1633,7 +1357,6 @@ async abort() {
         
         // Flush any pending data
         if (this._packetBuffer.length > 0) {
-            this._dispatchPacketChunk();
         }
         
         if (this._outputBuffer.length > 0) {
