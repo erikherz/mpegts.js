@@ -600,60 +600,148 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
-    /**
-     * Rescan the entire buffer for keyframes when normal detection is insufficient
-     * Uses alternative detection methods to find missed keyframes
-     */
-    _rescanBufferForKeyframes() {
-        // Reset keyframe tracking
-        this._keyframePositions = [];
+	/**
+	 * Rescan the entire buffer for keyframes when normal detection is insufficient
+	 * Uses alternative detection methods to find missed keyframes
+	 */
+	_rescanBufferForKeyframes() {
+	    // Reset keyframe tracking
+	    this._keyframePositions = [];
+	    this._lastDispatchedKeyframeIndex = -1;
 
-        // Scan for IDR pictures in the entire buffer
-        for (let i = 0; i < this._packetBuffer.length; i++) {
-            // Try alternative methods for detection
-            let isKeyframe = false;
+	    // Keep track of detection methods that worked
+	    const successfulMethods = [];
 
-            // Method 1: Check random access indicator in adaptation field
-            isKeyframe = this._isKeyframeByRAI(this._packetBuffer[i]);
+	    // Try method 1: RAI detection
+	    let keyframesFoundRAI = 0;
+	    for (let i = 0; i < this._packetBuffer.length; i++) {
+		if (this._isKeyframeByRAI(this._packetBuffer[i])) {
+		    this._keyframePositions.push(i);
+		    keyframesFoundRAI++;
+		}
+	    }
+	    
+	    if (keyframesFoundRAI > 0) {
+		successfulMethods.push('RAI');
+		if (this.config.enableDetailedLogging) {
+		    Log.v(this.TAG, `Rescan found ${keyframesFoundRAI} keyframes using RAI method`);
+		}
+	    }
 
-            // Method 2: Explicit search for H.264 IDR NAL units
-            if (!isKeyframe) {
-                isKeyframe = this._isKeyframeByNAL(this._packetBuffer[i]);
-            }
+	    // If RAI method didn't find enough keyframes, try NAL detection
+	    if (this._keyframePositions.length < 2) {
+		this._keyframePositions = [];
+		let keyframesFoundNAL = 0;
+		
+		for (let i = 0; i < this._packetBuffer.length; i++) {
+		    if (this._isKeyframeByNAL(this._packetBuffer[i])) {
+			this._keyframePositions.push(i);
+			keyframesFoundNAL++;
+		    }
+		}
+		
+		if (keyframesFoundNAL > 0) {
+		    successfulMethods.push('NAL');
+		    if (this.config.enableDetailedLogging) {
+			Log.v(this.TAG, `Rescan found ${keyframesFoundNAL} keyframes using NAL method`);
+		    }
+		}
+	    }
 
-            // Method 3: Check for PES packet starts with specific markers
-            if (!isKeyframe) {
-                isKeyframe = this._isKeyframeByPESHeader(this._packetBuffer[i]);
-            }
+	    // If NAL method didn't find enough keyframes, try PES header detection
+	    if (this._keyframePositions.length < 2) {
+		this._keyframePositions = [];
+		let keyframesFoundPES = 0;
+		
+		for (let i = 0; i < this._packetBuffer.length; i++) {
+		    if (this._isKeyframeByPESHeader(this._packetBuffer[i])) {
+			this._keyframePositions.push(i);
+			keyframesFoundPES++;
+		    }
+		}
+		
+		if (keyframesFoundPES > 0) {
+		    successfulMethods.push('PES');
+		    if (this.config.enableDetailedLogging) {
+			Log.v(this.TAG, `Rescan found ${keyframesFoundPES} keyframes using PES method`);
+		    }
+		}
+	    }
 
-            if (isKeyframe) {
-                this._keyframePositions.push(i);
-                if (this.config.enableDetailedLogging) {
-                    Log.v(this.TAG, `Rescan found keyframe at position ${i}`);
-                }
-            }
-        }
+	    // Final approach: Look for packet patterns that often indicate keyframes
+	    if (this._keyframePositions.length < 2) {
+		this._keyframePositions = [];
+		let keyframesFoundPattern = 0;
+		
+		// Scan for packets with adaptation field control and PUSI flag set
+		for (let i = 0; i < this._packetBuffer.length; i++) {
+		    const packet = this._packetBuffer[i];
+		    
+		    // Check for sync byte and payload unit start indicator (PUSI)
+		    if (packet[0] === 0x47 && (packet[1] & 0x40) !== 0) {
+			// Check for specific adaptation field patterns that often indicate keyframes
+			const adaptationFieldControl = (packet[3] & 0x30) >> 4;
+			
+			// Adaptation field with payload present
+			if (adaptationFieldControl === 0x03) {
+			    // Large adaptation field often indicates keyframe
+			    const adaptationFieldLength = packet[4];
+			    if (adaptationFieldLength > 10) {
+				this._keyframePositions.push(i);
+				keyframesFoundPattern++;
+			    }
+			}
+		    }
+		}
+		
+		if (keyframesFoundPattern > 0) {
+		    successfulMethods.push('Pattern');
+		    if (this.config.enableDetailedLogging) {
+			Log.v(this.TAG, `Rescan found ${keyframesFoundPattern} keyframes using pattern method`);
+		    }
+		}
+	    }
 
-        // If we found keyframes, log the results
-        if (this._keyframePositions.length > 0) {
-            Log.v(this.TAG, `Rescan found ${this._keyframePositions.length} keyframes`);
-            this.stats.keyframesDetected = this._keyframePositions.length;
-        } else {
-            // Fallback: If we still can't find keyframes, add artificial ones
-            Log.w(this.TAG, `Failed to detect any keyframes during rescan. Adding artificial keyframe markers.`);
+	    // If we found keyframes, log the results
+	    if (this._keyframePositions.length > 0) {
+		Log.v(this.TAG, `Rescan found ${this._keyframePositions.length} keyframes using methods: ${successfulMethods.join(', ')}`);
+		this.stats.keyframesDetected = this._keyframePositions.length;
+		
+		// Log specific positions if there are few keyframes
+		if (this._keyframePositions.length <= 10) {
+		    for (let i = 0; i < this._keyframePositions.length; i++) {
+			Log.v(this.TAG, `Rescan found keyframe at position ${this._keyframePositions[i]}`);
+		    }
+		}
+	    } else {
+		// Fallback: If we still can't find keyframes, add artificial ones
+		Log.w(this.TAG, `Failed to detect any keyframes during rescan. Adding artificial keyframe markers.`);
 
-            // Add artificial keyframes every ~1 second (assuming 30fps at 5Mbps)
-            const packetsPerSecond = (5 * 1024 * 1024) / 8 / this.PACKET_SIZE;
-            const packetsPerKeyframe = packetsPerSecond;
+		// Add artificial keyframes every ~1 second (assuming 30fps at 5Mbps)
+		const packetsPerSecond = Math.ceil((5 * 1024 * 1024) / 8 / this.PACKET_SIZE);
+		const packetsPerKeyframe = Math.min(packetsPerSecond, Math.floor(this._packetBuffer.length / 3));
 
-            for (let i = 0; i < this._packetBuffer.length; i += packetsPerKeyframe) {
-                this._keyframePositions.push(i);
-            }
+		// Ensure we add at least 3 keyframes if there's enough data
+		const keyframeInterval = Math.min(packetsPerKeyframe, Math.floor(this._packetBuffer.length / 3));
+		
+		for (let i = 0; i < this._packetBuffer.length; i += keyframeInterval) {
+		    this._keyframePositions.push(i);
+		}
 
-            Log.v(this.TAG, `Added ${this._keyframePositions.length} artificial keyframe markers`);
-            this.stats.keyframesDetected = this._keyframePositions.length;
-        }
-    }
+		Log.v(this.TAG, `Added ${this._keyframePositions.length} artificial keyframe markers`);
+		this.stats.keyframesDetected = this._keyframePositions.length;
+	    }
+	    
+	    // Always make sure the first packet is treated as a keyframe if no keyframes were found at 0
+	    if (this._keyframePositions.length > 0 && this._keyframePositions[0] > 0) {
+		this._keyframePositions.unshift(0);
+	    } else if (this._keyframePositions.length === 0 && this._packetBuffer.length > 0) {
+		this._keyframePositions.push(0);
+	    }
+	    
+	    // Sort positions to ensure they're in ascending order
+	    this._keyframePositions.sort((a, b) => a - b);
+	}
 
     /**
      * Check for keyframes using the Random Access Indicator in adaptation field
@@ -877,131 +965,160 @@ class WebTransportLoader extends BaseLoader {
             }
         }
     }
-    }
 
-    /**
-     * Dispatches chunks that start with keyframes and include all data up to the next keyframe
-     */
-    _dispatchKeyframeAwareChunk() {
-        // If no keyframes available, we can't dispatch anything yet
-        if (this._keyframePositions.length <= 1) {
-            if (this.config.enableDetailedLogging && this._keyframePositions.length === 1) {
-                Log.v(this.TAG, `Only one keyframe in buffer, waiting for next keyframe before dispatching`);
-            }
+	/**
+	 * Dispatches chunks that start with keyframes and include all data up to the next keyframe
+	 */
+	_dispatchKeyframeAwareChunk() {
+	    // If no keyframes available or only one keyframe, we can't dispatch a complete segment
+	    if (this._keyframePositions.length <= 1) {
+		if (this.config.enableDetailedLogging && this._keyframePositions.length === 1) {
+		    Log.v(this.TAG, `Only one keyframe in buffer, waiting for next keyframe before dispatching`);
+		}
 
-            // Safety check: If buffer is extremely full but we don't have enough keyframes,
-            // force dispatch using non-keyframe aware method to prevent stalling
-            if (this._packetBuffer.length > this.config.bufferSizeInPackets * 3) {
-                const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets * 2;
-                Log.w(this.TAG, `Buffer extremely full (${this._packetBuffer.length} packets) but not enough keyframes. ` +
-                     `Forcing dispatch of ${excessPackets} packets to prevent stall.`);
-                this._dispatchPacketChunk(excessPackets);
+		// Safety check: If buffer is extremely full but we don't have enough keyframes,
+		// force dispatch using non-keyframe aware method to prevent stalling
+		if (this._packetBuffer.length > this.config.bufferSizeInPackets * 3) {
+		    const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets * 2;
+		    Log.w(this.TAG, `Buffer extremely full (${this._packetBuffer.length} packets) but not enough keyframes. ` +
+			 `Forcing dispatch of ${excessPackets} packets to prevent stall.`);
+		    this._dispatchPacketChunk(excessPackets);
 
-                // Reset keyframe positions to account for removed packets
-                if (this._keyframePositions.length > 0) {
-                    const newPositions = [];
-                    for (let pos of this._keyframePositions) {
-                        const newPos = pos - excessPackets;
-                        if (newPos >= 0) {
-                            newPositions.push(newPos);
-                        }
-                    }
-                    this._keyframePositions = newPositions;
-                }
-            	return;
-            }
-        }
+		    // Reset keyframe positions to account for removed packets
+		    this._keyframePositions = this._keyframePositions
+			.map(pos => pos - excessPackets)
+			.filter(pos => pos >= 0);
+		    
+		    // Reset the last dispatched keyframe index since we've modified the array
+		    this._lastDispatchedKeyframeIndex = -1;
+		    return;
+		}
+		return;
+	    }
 
-        // Find the keyframe index we should start dispatching from
-        let startKeyframeIndex = this._lastDispatchedKeyframeIndex + 1;
+	    // Find the keyframe index we should start dispatching from
+	    let startKeyframeIndex = 0;
+	    
+	    // If we haven't dispatched any keyframes yet, start from the first one
+	    if (this._lastDispatchedKeyframeIndex >= 0) {
+		startKeyframeIndex = this._lastDispatchedKeyframeIndex + 1;
+		
+		// If we've already dispatched all keyframes, reset to first keyframe
+		if (startKeyframeIndex >= this._keyframePositions.length) {
+		    if (this.config.enableDetailedLogging) {
+			Log.w(this.TAG, `Keyframe index out of bounds (${startKeyframeIndex}/${this._keyframePositions.length}), resetting to 0`);
+		    }
+		    startKeyframeIndex = 0;
+		}
+	    }
 
-        // If we've never dispatched or buffer was reset, start from first keyframe
-        if (startKeyframeIndex >= this._keyframePositions.length) {
-            // This should not typically happen, but just in case
-            if (this.config.enableDetailedLogging) {
-                Log.w(this.TAG, `Keyframe index out of bounds (${startKeyframeIndex}/${this._keyframePositions.length}), resetting to 0`);
-            }
-            startKeyframeIndex = 0;
-        }
+	    // Get the position of the starting keyframe
+	    const startPos = this._keyframePositions[startKeyframeIndex];
+	    
+	    // Find how many complete segments (keyframe to keyframe) we can dispatch
+	    let endKeyframeIndex = startKeyframeIndex;
+	    
+	    while (endKeyframeIndex + 1 < this._keyframePositions.length) {
+		// Check if dispatching up to the next keyframe would bring buffer below target
+		const nextKeyframePos = this._keyframePositions[endKeyframeIndex + 1];
+		
+		// Make sure nextKeyframePos is valid
+		if (isNaN(nextKeyframePos) || nextKeyframePos < 0 || nextKeyframePos >= this._packetBuffer.length) {
+		    Log.w(this.TAG, `Invalid next keyframe position: ${nextKeyframePos}. Resetting keyframe tracking.`);
+		    // Rescan the buffer to rebuild keyframe positions
+		    this._rescanBufferForKeyframes();
+		    return;
+		}
 
-        // Find how many complete segments (keyframe to keyframe) we can dispatch
-        let endKeyframeIndex = startKeyframeIndex;
-        while (endKeyframeIndex + 1 < this._keyframePositions.length) {
-            // Check if dispatching up to the next keyframe would bring buffer below target
-            const nextKeyframePos = this._keyframePositions[endKeyframeIndex + 1];
+		// Allow buffer to go below target if it's too full
+		const effectiveTarget = this._packetBuffer.length > this.config.bufferSizeInPackets * 2 ?
+		     this.config.bufferSizeInPackets / 2 : this.config.bufferSizeInPackets;
 
-            // Allow buffer to go below target if it's too full
-            const effectiveTarget = this._packetBuffer.length > this.config.bufferSizeInPackets * 2 ?
-                 this.config.bufferSizeInPackets / 2 : this.config.bufferSizeInPackets;
+		// Calculate remaining buffer after dispatching to next keyframe
+		const remainingAfterDispatch = this._packetBuffer.length - nextKeyframePos;
+		
+		if (this.config.enableDetailedLogging) {
+		    Log.v(this.TAG, `Checking keyframe ${endKeyframeIndex+1}: pos=${nextKeyframePos}, remaining=${remainingAfterDispatch}, target=${effectiveTarget}`);
+		}
+		
+		if (remainingAfterDispatch < effectiveTarget) {
+		    // Stop here to maintain minimum buffer size
+		    break;
+		}
+		endKeyframeIndex++;
+	    }
 
-            if (this._packetBuffer.length - nextKeyframePos < effectiveTarget) {
-                // Stop here to maintain minimum buffer size
-                break;
-            }
-            endKeyframeIndex++;
-        }
+	    // If we can't dispatch a complete segment while maintaining buffer, but buffer is very full
+	    // then relax the buffer requirement to prevent stalling
+	    if (endKeyframeIndex === startKeyframeIndex && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
+		if (startKeyframeIndex + 1 < this._keyframePositions.length) {
+		    endKeyframeIndex = startKeyframeIndex + 1;
+		    if (this.config.enableDetailedLogging) {
+			Log.v(this.TAG, `Buffer very full, relaxing buffer requirement to dispatch a segment`);
+		    }
+		}
+	    }
 
-        // If we can't dispatch a complete segment while maintaining buffer, but buffer is very full
-        // then relax the buffer requirement to prevent stalling
-        if (endKeyframeIndex <= startKeyframeIndex && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
-            if (startKeyframeIndex + 1 < this._keyframePositions.length) {
-                endKeyframeIndex = startKeyframeIndex + 1;
-                if (this.config.enableDetailedLogging) {
-                    Log.v(this.TAG, `Buffer very full, relaxing buffer requirement to dispatch a segment`);
-                }
-            }
-        }
+	    // If we still can't dispatch a complete segment, don't dispatch
+	    if (endKeyframeIndex === startKeyframeIndex) {
+		if (this.config.enableDetailedLogging && startKeyframeIndex + 1 < this._keyframePositions.length) {
+		    const nextKeyframePos = this._keyframePositions[startKeyframeIndex + 1];
+		    const remainingAfterDispatch = this._packetBuffer.length - nextKeyframePos;
+		    Log.v(this.TAG, `Buffer would go below target if we dispatched to next keyframe ` +
+			 `(${remainingAfterDispatch}/${this.config.bufferSizeInPackets}), waiting`);
+		}
+		return;
+	    }
 
-        // If we still can't dispatch a complete segment, don't dispatch
-        if (endKeyframeIndex <= startKeyframeIndex) {
-            if (this.config.enableDetailedLogging) {
-                const nextKeyframePos = this._keyframePositions[startKeyframeIndex + 1];
-                Log.v(this.TAG, `Buffer would go below target if we dispatched to next keyframe ` +
-                     `(${this._packetBuffer.length - nextKeyframePos}/${this.config.bufferSizeInPackets}), waiting`);
-            }
-            return;
-        }
+	    // Calculate packets to dispatch
+	    const endPos = this._keyframePositions[endKeyframeIndex];
+	    const packetsToDispatch = endPos - startPos;
 
-        // Calculate packets to dispatch
-        const startPos = this._keyframePositions[startKeyframeIndex];
-        const endPos = this._keyframePositions[endKeyframeIndex];
-        const packetsToDispatch = endPos - startPos;
+	    // Check for extreme segment size
+	    if (packetsToDispatch > 1500) {
+		Log.w(this.TAG, `Very large segment detected (${packetsToDispatch} packets). ` +
+		     `This may indicate keyframe detection issues. Limiting to 1000 packets.`);
 
-        // Check for extreme segment size
-        if (packetsToDispatch > 1500) {
-            Log.w(this.TAG, `Very large segment detected (${packetsToDispatch} packets). ` +
-                 `This may indicate keyframe detection issues. Limiting to 1000 packets.`);
+		// Find a suitable position to split
+		let splitPos = Math.min(startPos + 1000, this._packetBuffer.length);
 
-            // Find a suitable position to split
-            let splitPos = Math.min(startPos + 1000, this._packetBuffer.length);
+		// Dispatch partial segment
+		this._dispatchPacketChunk(splitPos);
 
-            // Dispatch partial segment
-            this._dispatchPacketChunk(splitPos);
+		// Update keyframe positions
+		this._keyframePositions = this._keyframePositions
+		    .map(pos => pos - splitPos)
+		    .filter(pos => pos >= 0);
+		    
+		// Reset the last dispatched keyframe index
+		this._lastDispatchedKeyframeIndex = -1;
 
-            // Update keyframe positions
-            this._keyframePositions = this._keyframePositions
-                .map(pos => pos - splitPos)
-                .filter(pos => pos >= 0);
+		return;
+	    }
 
-            return;
-        }
+	    if (this.config.enableDetailedLogging) {
+		Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
+		     `(${packetsToDispatch} packets), maintaining ${this._packetBuffer.length - endPos} in buffer`);
+	    }
 
-        if (this.config.enableDetailedLogging) {
-            Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
-                 `(${packetsToDispatch} packets), maintaining ${this._packetBuffer.length - endPos} in buffer`);
-        }
+	    // Dispatch the segment
+	    this._dispatchPacketChunk(packetsToDispatch);
 
-        // Dispatch the segment
-        this._dispatchPacketChunk(packetsToDispatch);
+	    // Update keyframe tracking (this is a key fix!)
+	    this._lastDispatchedKeyframeIndex = endKeyframeIndex - 1;
 
-        // Update keyframe tracking
-        this._lastDispatchedKeyframeIndex = endKeyframeIndex - 1;
-
-        // Update keyframe positions to account for removed packets
-        this._keyframePositions = this._keyframePositions
-            .slice(endKeyframeIndex)
-            .map(pos => pos - endPos);
-    }
+	    // Update keyframe positions to account for removed packets
+	    const removedPackets = endPos;
+	    this._keyframePositions = this._keyframePositions
+		.slice(endKeyframeIndex)
+		.map(pos => pos - removedPackets)
+		.filter(pos => pos >= 0 && pos < this._packetBuffer.length);
+		
+	    if (this._keyframePositions.length === 0) {
+		// If we've dispatched all keyframes, reset the index
+		this._lastDispatchedKeyframeIndex = -1;
+	    }
+	}
 
     /**
      * Process PTS information in a packet and detect keyframes
