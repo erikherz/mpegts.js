@@ -316,7 +316,7 @@ class WebTransportLoader extends BaseLoader {
         // Configure settings
         this.config = {
             enableDetailedLogging: false,
-            packetFlushThreshold: 100,  // Number of packets per chunk
+            packetFlushThreshold: 50,  // Number of packets per chunk
             enablePTSContinuity: true   // Enable PTS continuity handling
         };
 
