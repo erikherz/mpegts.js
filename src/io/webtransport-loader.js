@@ -320,19 +320,19 @@ class WebTransportLoader extends BaseLoader {
             enableDetailedLogging: options.enableDetailedLogging !== undefined ? 
                                   options.enableDetailedLogging : true,
             
-            // Buffer settings
-            bufferSizeInPackets: options.bufferSizeInPackets || 400,     
-            minBufferSizeInPackets: options.minBufferSizeInPackets || 200, 
-            maxBufferSize: options.maxBufferSize || 1000,                 
-            forceDispatchThreshold: options.forceDispatchThreshold || 600, 
-            
+	     // Buffer settings
+	    bufferSizeInPackets: 800,              // Increase from 400 to 800
+	    minBufferSizeInPackets: 400,           // Increase from 200 to 400
+	    maxBufferSize: 1200,                   // Increase from 1000 to 1200
+	    forceDispatchThreshold: 1000,          // Increase from 600 to 1000
+
             // Playback settings
             enablePTSContinuity: options.enablePTSContinuity !== undefined ? 
                                 options.enablePTSContinuity : true,
-            initialBufferingThreshold: options.initialBufferingThreshold || 0.9,
+            initialBufferingThreshold: options.initialBufferingThreshold || 0.95,
             
             // Dispatch settings
-            dispatchChunkSize: options.dispatchChunkSize || 50,
+            dispatchChunkSize: options.dispatchChunkSize || 75,
             keyframeAwareChunking: options.keyframeAwareChunking !== undefined ? 
                                  options.keyframeAwareChunking : true,
             keyframeDetectionRetries: options.keyframeDetectionRetries || 3,
