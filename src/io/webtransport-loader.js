@@ -1202,7 +1202,29 @@ async open(dataSource) {
         // Get streams directly after connection established
         const incomingStreams = this._transport.incomingUnidirectionalStreams;
         const streamReader = incomingStreams.getReader();
-        const { value: stream } = await streamReader.read();
+        //const { value: stream } = await streamReader.read();
+	Log.v(this.TAG, "Waiting for a new incoming stream...");
+	//const { value: stream, done } = await streamReader.read();
+	Log.v(this.TAG, "🔄 Waiting for the next WebTransport stream...");
+	const { value: stream, done } = await streamReader.read();
+	if (done) {
+	    Log.e(this.TAG, "❌ StreamReader returned done. No more streams received.");
+	} else {
+	    Log.v(this.TAG, "✅ New WebTransport stream received!");
+	}
+
+	if (done) {
+	    Log.e(this.TAG, "StreamReader returned done. No more streams.");
+	    
+	    // Check if the WebTransport connection is still open
+	    if (!this._transport || this._transport.closed) {
+		Log.e(this.TAG, "❌ WebTransport connection unexpectedly closed.");
+	    } else {
+		Log.v(this.TAG, "✅ WebTransport connection still open. Waiting for new streams...");
+	    }
+	} else {
+	    Log.v(this.TAG, "✅ New WebTransport stream received.");
+	}
 
         if (!stream) {
             throw new Error('No incoming stream received');
@@ -1380,174 +1402,116 @@ async _processStreamData(streamId, reader) {
     if (!reader) {
         const streamData = this._activeStreams.get(streamId);
         if (!streamData || !streamData.reader) {
-            Log.e(this.TAG, `No reader available for stream ${streamId}`);
+            Log.e(this.TAG, `❌ No reader available for stream ${streamId}`);
             return;
         }
         reader = streamData.reader;
     }
-    
-    Log.v(this.TAG, `Processing stream ${streamId}`);
-    
+
+    Log.v(this.TAG, `🔄 Starting to process stream ${streamId}...`);
+
     try {
         let pendingData = new Uint8Array(0);
-        
+
         while (!this._requestAbort) {
             try {
-                const { value, done } = await reader.read();
-                
-                // Check abort flag after the async read operation
-                if (this._requestAbort) break;
-                
-                if (done) {
-                    // Stream ended
-                    Log.v(this.TAG, `Stream ${streamId} ended`);
-                    
-                    // Process any remaining valid data
-                    if (pendingData.length >= 188) {
-                        const validLength = Math.floor(pendingData.length / 188) * 188;
-                        
-                        if (this.config.enableStreamRotationHandler) {
-                            // Use rotation handler
-                            const result = this.streamRotationHandler.processStreamData(
-                                streamId, pendingData.slice(0, validLength), this.packetValidator
-                            );
-                            
-                            if (result && result.shouldFlush) {
-                                const packets = this.streamRotationHandler.flushBuffers();
-                                this._handleProcessedPackets(packets);
-                            }
-                        } else {
-                            // Use direct processing
-                            const packets = this.tsBuffer.addChunk(pendingData.slice(0, validLength));
-                            if (packets) {
-                                this._processPackets(packets);
-                            }
-                        }
-                    }
-                    
-                    // Update stream status
-                    const streamData = this._activeStreams.get(streamId);
-                    if (streamData) {
-                        streamData.status = 'ended';
-                        this._activeStreams.set(streamId, streamData);
-                    }
-                    
-                    // Notify the rotation handler that the stream has ended
-                    if (this.streamRotationHandler) {
-                        const remainingPackets = this.streamRotationHandler.endStream(streamId);
-                        if (remainingPackets && remainingPackets.length > 0) {
-                            this._handleProcessedPackets(remainingPackets);
-                        }
-                    }
-                    
+                Log.v(this.TAG, `🔄 Waiting to read from stream ${streamId}...`);
+                const { value: chunk, done: isDone } = await reader.read();
+                Log.v(this.TAG, `✅ reader.read() completed for stream ${streamId}.`);
+
+                if (isDone) {
+                    Log.e(this.TAG, `❌ Stream ${streamId} ended immediately.`);
                     break;
                 }
-                
-                if (value) {
-                    // Get chunk as Uint8Array
-                    let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-                    
-                    // Update stream statistics
-                    const streamData = this._activeStreams.get(streamId);
-                    if (streamData) {
-                        streamData.bytesReceived += chunk.length;
-                        this._activeStreams.set(streamId, streamData);
-                    }
-                    
-                    // Combine with any pending data from previous chunks
-                    if (pendingData.length > 0) {
-                        const newBuffer = new Uint8Array(pendingData.length + chunk.length);
-                        newBuffer.set(pendingData, 0);
-                        newBuffer.set(chunk, pendingData.length);
-                        chunk = newBuffer;
-                        pendingData = new Uint8Array(0);
-                    }
-                    
-                    // Find and align to the first valid sync byte pattern
-                    const syncIndex = this._findAlignedSyncByte(chunk);
-                    
-                    if (syncIndex === -1) {
-                        // No valid pattern found, store the chunk for next iteration
-                        pendingData = chunk;
-                        continue;
-                    } else if (syncIndex > 0) {
-                        // Skip data before the first valid sync byte
-                        chunk = chunk.slice(syncIndex);
-                    }
-                    
-                    // Process only complete 188-byte packets
-                    const validLength = Math.floor(chunk.length / 188) * 188;
-                    
-                    if (validLength > 0) {
-                        if (this.config.enableStreamRotationHandler) {
-                            // Use rotation handler
-                            const result = this.streamRotationHandler.processStreamData(
-                                streamId, chunk.slice(0, validLength), this.packetValidator
-                            );
-                            
-                            // Update stream statistics
-                            if (result && streamData) {
-                                streamData.packetsProcessed += result.packetCount || 0;
-                                this._activeStreams.set(streamId, streamData);
-                            }
-                            
-                            // Check if we need to flush
-                            if (result && result.shouldFlush) {
-                                const packets = this.streamRotationHandler.flushBuffers();
-                                this._handleProcessedPackets(packets);
-                            }
-                        } else {
-                            // Use direct processing
-                            const packets = this.tsBuffer.addChunk(chunk.slice(0, validLength));
-                            if (packets) {
-                                this._processPackets(packets);
-                                
-                                // Update stream statistics
-                                if (streamData) {
-                                    streamData.packetsProcessed += packets.length;
-                                    this._activeStreams.set(streamId, streamData);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Store any remaining partial packet for the next chunk
-                    if (validLength < chunk.length) {
-                        pendingData = chunk.slice(validLength);
-                    }
+
+                if (!chunk || chunk.byteLength === 0) {
+                    Log.e(this.TAG, `⚠️ Stream ${streamId} read returned empty data. Possible server issue.`);
+                    continue;
+                }
+
+                Log.v(this.TAG, `📥 Successfully received ${chunk.byteLength} bytes from stream ${streamId}.`);
+
+                // Append new data to pending buffer
+                let dataBuffer = chunk;
+                if (pendingData.length > 0) {
+                    const newBuffer = new Uint8Array(pendingData.length + chunk.length);
+                    newBuffer.set(pendingData, 0);
+                    newBuffer.set(chunk, pendingData.length);
+                    dataBuffer = newBuffer;
+                    pendingData = new Uint8Array(0);
+                }
+
+                // Find MPEG-TS sync byte alignment
+                const syncIndex = this._findAlignedSyncByte(dataBuffer);
+                if (syncIndex === -1) {
+                    Log.e(this.TAG, `⚠️ No MPEG-TS sync byte found in stream ${streamId}. Storing for next read.`);
+                    pendingData = dataBuffer;
+                    continue;
+                } else if (syncIndex > 0) {
+                    Log.v(this.TAG, `🔄 Skipping ${syncIndex} bytes to align MPEG-TS packets.`);
+                    dataBuffer = dataBuffer.slice(syncIndex);
+                }
+
+                // Process complete 188-byte MPEG-TS packets
+                const validLength = Math.floor(dataBuffer.length / 188) * 188;
+                if (validLength > 0) {
+                    Log.v(this.TAG, `📦 Processing ${validLength} bytes from stream ${streamId}.`);
+                    this._handleIncomingPackets(streamId, dataBuffer.slice(0, validLength));
+                }
+
+                // Store leftover bytes for next read
+                if (validLength < dataBuffer.length) {
+                    pendingData = dataBuffer.slice(validLength);
                 }
             } catch (readError) {
-                // If the error is due to abort, handle gracefully
-                if (this._requestAbort) {
-                    break;
-                }
-                
-                Log.e(this.TAG, `Error reading from stream ${streamId}: ${readError.message}`);
-                
-                // Update stream status
-                const streamData = this._activeStreams.get(streamId);
-                if (streamData) {
-                    streamData.status = 'error';
-                    streamData.error = readError.message;
-                    this._activeStreams.set(streamId, streamData);
-                }
-                
-                // Small delay before retry
-                await new Promise(resolve => setTimeout(resolve, 100));
+                if (this._requestAbort) break;
+
+                Log.e(this.TAG, `❌ Error reading from stream ${streamId}: ${readError.message}`);
+                this._updateStreamStatus(streamId, 'error', readError.message);
+                await new Promise(resolve => setTimeout(resolve, 100)); // Small delay before retry
             }
         }
     } catch (e) {
         if (!this._requestAbort) {
-            Log.e(this.TAG, `Error processing stream ${streamId}: ${e.message}`);
-            
-            // Update stream status
-            const streamData = this._activeStreams.get(streamId);
-            if (streamData) {
-                streamData.status = 'error';
-                streamData.error = e.message;
-                this._activeStreams.set(streamId, streamData);
-            }
+            Log.e(this.TAG, `❌ Fatal error processing stream ${streamId}: ${e.message}`);
+            this._updateStreamStatus(streamId, 'error', e.message);
         }
+    }
+
+    Log.v(this.TAG, `🔴 Stream ${streamId} processing stopped.`);
+}
+
+_handleIncomingPackets(streamId, chunk) {
+    const streamData = this._activeStreams.get(streamId);
+
+    if (this.config.enableStreamRotationHandler) {
+        const result = this.streamRotationHandler.processStreamData(streamId, chunk, this.packetValidator);
+
+        if (result?.shouldFlush) {
+            const packets = this.streamRotationHandler.flushBuffers();
+            this._handleProcessedPackets(packets);
+        }
+    } else {
+        const packets = this.tsBuffer.addChunk(chunk);
+        if (packets) {
+            this._processPackets(packets);
+        }
+    }
+
+    if (streamData) {
+        streamData.bytesReceived += chunk.length;
+        this._activeStreams.set(streamId, streamData);
+    }
+}
+
+_updateStreamStatus(streamId, status, errorMessage = null) {
+    const streamData = this._activeStreams.get(streamId);
+    if (streamData) {
+        streamData.status = status;
+        if (errorMessage) {
+            streamData.error = errorMessage;
+        }
+        this._activeStreams.set(streamId, streamData);
     }
 }
 
