@@ -1037,123 +1037,172 @@ async _readStreamData(reader) {
         return isKeyframe;
     }
     
-    /**
-     * Dispatches chunks that start with keyframes and include all data up to the next keyframe
-     * Final version with improved buffer management and fallback logic
-     */
-    _dispatchKeyframeAwareChunk() {
-        // Get the current number of keyframes detected
-        const numKeyframes = this._keyframePositions.length;
-        
-        // If no keyframes available, scan for keyframes if buffer is large enough
-        if (numKeyframes === 0 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
-            Log.v(this.TAG, `No keyframes detected in buffer of ${this._packetBuffer.length} packets. Forcing keyframe scan.`);
-            this._rescanBufferForKeyframes();
-            
-            // If rescan still finds no keyframes, fallback to non-keyframe aware dispatch
-            if (this._keyframePositions.length === 0) {
-                Log.w(this.TAG, `Still no keyframes after rescan. Falling back to regular dispatch.`);
-                const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
-                this._dispatchPacketChunk(Math.max(excessPackets, 50));
-                return;
-            }
-        }
-        
-        // Standard case: If we have at least two keyframes, dispatch a complete segment
-        if (numKeyframes >= 2) {
-            // Find the keyframe index we should start dispatching from
-            let startKeyframeIndex = 0;
-            
-            // Get the position of the starting keyframe
-            const startPos = this._keyframePositions[startKeyframeIndex];
-            
-            // In most cases, we'll just dispatch from first keyframe to second keyframe
-            const endKeyframeIndex = 1;
-            const endPos = this._keyframePositions[endKeyframeIndex];
-            const packetsToDispatch = endPos - startPos;
-            
-            if (this.config.enableDetailedLogging) {
-                Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
-                     `(${packetsToDispatch} packets), maintaining ${this._packetBuffer.length - endPos} in buffer`);
-            }
-            
-            // Dispatch the segment
-            this._dispatchPacketChunk(endPos);
-            
-            // Update keyframe positions to account for removed packets
-            this._keyframePositions = this._keyframePositions
-                .slice(endKeyframeIndex)
-                .map(pos => pos - endPos)
-                .filter(pos => pos >= 0 && pos < this._packetBuffer.length);
-                
-            return;
-        }
-        
-        // Handle the case where we have only one keyframe:
-        if (numKeyframes === 1) {
-            const keyframePos = this._keyframePositions[0];
-            
-            // If the keyframe is not at the beginning, dispatch data up to the keyframe
-            if (keyframePos > 0) {
-                Log.v(this.TAG, `Dispatching ${keyframePos} packets before keyframe`);
-                this._dispatchPacketChunk(keyframePos);
-                
-                // Update keyframe positions
-                this._keyframePositions[0] = 0;
-                return;
-            }
-            
-            // If we have had only one keyframe for a while, we need to dispatch something
-            // Check if buffer is getting too large
-            if (this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
-                // Determine a safe amount to dispatch (about 1/3 of buffer size or 30 frames worth, whichever is smaller)
-                const safeDispatchAmount = Math.min(
-                    Math.floor(this._packetBuffer.length / 3),
-                    30 * 20  // Approximately 30 frames worth of packets (assuming 20 packets/frame)
-                );
-                
-                // Ensure we don't dispatch the entire buffer
-                const actualDispatchAmount = Math.min(
-                    safeDispatchAmount,
-                    Math.max(0, this._packetBuffer.length - this.config.bufferSizeInPackets / 2)
-                );
-                
-                if (actualDispatchAmount > 20) {  // Only dispatch if we have a meaningful amount
-                    Log.v(this.TAG, `Single keyframe but growing buffer (${this._packetBuffer.length} packets). ` +
-                          `Dispatching ${actualDispatchAmount} packets.`);
-                    
-                    this._dispatchPacketChunk(actualDispatchAmount);
-                    
-                    // Since we dispatched from the beginning and keyframe was at 0,
-                    // we need to update keyframe positions
-                    this._keyframePositions = [];
-                    
-                    // Rescan buffer to find new keyframes
-                    this._rescanBufferForKeyframes();
-                    return;
-                }
-            }
-            
-            if (this.config.enableDetailedLogging) {
-                Log.v(this.TAG, `Only one keyframe in buffer, waiting for next keyframe before dispatching`);
-            }
-            return;
-        }
-        
-        // If we reach here with no keyframes, just wait for more data
-        if (numKeyframes === 0 && this._packetBuffer.length < this.config.bufferSizeInPackets * 1.5) {
-            if (this.config.enableDetailedLogging) {
-                Log.v(this.TAG, `No keyframes detected yet, waiting for keyframes (buffer: ${this._packetBuffer.length} packets)`);
-            }
-        } else if (this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
-            // Buffer is getting too full but no keyframes - dispatch some data anyway
-            const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
-            Log.w(this.TAG, `Buffer full (${this._packetBuffer.length} packets) but no keyframes. ` +
-                  `Dispatching ${excessPackets} packets.`);
-            this._dispatchPacketChunk(excessPackets);
-        }
-    }
-    
+	_dispatchKeyframeAwareChunk() {
+	    // SAFETY CHECK - If buffer is extremely large, force non-keyframe dispatch
+	    if (this._packetBuffer.length > 1500) {
+		// Critical situation - force dispatch regardless of keyframes
+		const packetsToDispatch = Math.min(this._packetBuffer.length - 400, 1000);
+		Log.w(this.TAG, `EMERGENCY: Buffer critically full (${this._packetBuffer.length} packets). ` +
+		      `Forcing non-keyframe dispatch of ${packetsToDispatch} packets.`);
+		
+		this._dispatchPacketChunk(packetsToDispatch);
+		
+		// Reset keyframe tracking since we've changed the buffer significantly
+		this._keyframePositions = [];
+		this._rescanBufferForKeyframes();
+		return;
+	    }
+	    
+	    // Get the current number of keyframes detected
+	    const numKeyframes = this._keyframePositions.length;
+	    
+	    // Stream transition handling
+	    if (this._ptsHandler._newStreamStarted) {
+		Log.v(this.TAG, `Stream transition detected with ${numKeyframes} keyframes in buffer`);
+		
+		// Add a forced rescan in case keyframes weren't detected yet
+		if (numKeyframes < 2) {
+		    this._rescanBufferForKeyframes();
+		}
+		
+		// Ensure we have at least one keyframe
+		if (this._keyframePositions.length === 0) {
+		    Log.w(this.TAG, `No keyframes found after stream transition. Marking first packet as keyframe.`);
+		    this._keyframePositions.push(0); // Force first packet to be considered a keyframe
+		}
+		
+		// CRITICAL FIX: Calculate a substantial chunk size for the first dispatch after stream transition
+		// Ensure we never send just a single packet
+		const minStreamInitPackets = 50; // Minimum amount to include full codec data
+		
+		let packetsToDispatch = minStreamInitPackets;
+		
+		if (this._keyframePositions.length > 1) {
+		    // If we have multiple keyframes, dispatch BOTH the first and second keyframe together
+		    // This is crucial - the codec info is often spread across multiple keyframes
+		    const secondKeyframePos = this._keyframePositions[1];
+		    // Add extra packets after the second keyframe
+		    packetsToDispatch = Math.max(minStreamInitPackets, secondKeyframePos + 30);
+		} else {
+		    // Only have one keyframe, take a large chunk
+		    packetsToDispatch = Math.max(minStreamInitPackets, Math.floor(this._packetBuffer.length / 3));
+		}
+		
+		// Limit to available packets
+		packetsToDispatch = Math.min(packetsToDispatch, this._packetBuffer.length);
+		
+		Log.v(this.TAG, `Stream transition: Dispatching ${packetsToDispatch} packets to ensure complete codec initialization`);
+		
+		// Dispatch the packets
+		this._dispatchPacketChunk(packetsToDispatch);
+		
+		// Clear the new stream flag after dispatch
+		this._ptsHandler._newStreamStarted = false;
+		
+		// Update keyframe positions
+		this._keyframePositions = this._keyframePositions
+		    .map(pos => pos - packetsToDispatch)
+		    .filter(pos => pos >= 0);
+		    
+		return;
+	    }
+	    
+	    // If no keyframes but buffer getting large, force a rescan
+	    if (numKeyframes === 0 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
+		Log.v(this.TAG, `No keyframes in buffer of ${this._packetBuffer.length} packets. Forcing keyframe scan.`);
+		this._rescanBufferForKeyframes();
+		
+		// If still no keyframes, force some dispatch
+		if (this._keyframePositions.length === 0 && 
+		    this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
+		    const packetsToDispatch = Math.min(this._packetBuffer.length / 2, 400);
+		    Log.w(this.TAG, `Still no keyframes after scan. Dispatching ${Math.floor(packetsToDispatch)} packets regardless.`);
+		    this._dispatchPacketChunk(Math.floor(packetsToDispatch));
+		    return;
+		}
+	    }
+	    
+	    // Standard case: If we have at least two keyframes, dispatch a complete segment
+	    if (numKeyframes >= 2) {
+		// Find the keyframe index we should start dispatching from
+		let startKeyframeIndex = 0;
+		
+		// Get the position of the starting keyframe
+		const startPos = this._keyframePositions[startKeyframeIndex];
+		
+		// In most cases, we'll just dispatch from first keyframe to second keyframe
+		const endKeyframeIndex = 1;
+		const endPos = this._keyframePositions[endKeyframeIndex];
+		const packetsToDispatch = endPos;
+		
+		if (this.config.enableDetailedLogging) {
+		    Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
+			 `(${packetsToDispatch} packets), maintaining ${this._packetBuffer.length - endPos} in buffer`);
+		}
+		
+		// Dispatch the segment
+		this._dispatchPacketChunk(endPos);
+		
+		// Update keyframe positions to account for removed packets
+		this._keyframePositions = this._keyframePositions
+		    .slice(endKeyframeIndex)
+		    .map(pos => pos - endPos)
+		    .filter(pos => pos >= 0 && pos < this._packetBuffer.length);
+		    
+		return;
+	    }
+	    
+	    // Handle the case where we have only one keyframe:
+	    if (numKeyframes === 1) {
+		const keyframePos = this._keyframePositions[0];
+		
+		// If the keyframe is not at the beginning, dispatch data up to the keyframe
+		if (keyframePos > 0) {
+		    Log.v(this.TAG, `Dispatching ${keyframePos} packets before keyframe`);
+		    this._dispatchPacketChunk(keyframePos);
+		    
+		    // Update keyframe positions
+		    this._keyframePositions[0] = 0;
+		    return;
+		}
+		
+		// If buffer is getting too large with just one keyframe, dispatch some data
+		if (this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
+		    const packetsToDispatch = Math.min(
+			Math.floor(this._packetBuffer.length / 3),
+			300
+		    );
+		    Log.v(this.TAG, `Buffer large with one keyframe. Dispatching ${packetsToDispatch} packets.`);
+		    this._dispatchPacketChunk(packetsToDispatch);
+		    
+		    // Reset keyframe positions
+		    this._keyframePositions = [];
+		    this._rescanBufferForKeyframes();
+		    return;
+		}
+	    }
+	    
+	    // Force dispatch if buffer exceeds threshold, regardless of keyframes
+	    if (this._packetBuffer.length > this.config.forceDispatchThreshold) {
+		const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
+		Log.w(this.TAG, `Buffer exceeding threshold (${this._packetBuffer.length}/${this.config.forceDispatchThreshold}). ` +
+		     `Forcing dispatch of ${excessPackets} packets.`);
+		this._dispatchPacketChunk(excessPackets);
+		
+		// Reset keyframe detection after forced dispatch
+		this._keyframePositions = [];
+		this._rescanBufferForKeyframes();
+		return;
+	    }
+	    
+	    // If we reach here with no keyframes and buffer is not too full, wait for more data
+	    if (numKeyframes === 0 && this._packetBuffer.length < this.config.bufferSizeInPackets * 1.5) {
+		if (this.config.enableDetailedLogging) {
+		    Log.v(this.TAG, `No keyframes detected yet, waiting (buffer: ${this._packetBuffer.length} packets)`);
+		}
+	    }
+	}
+
     /**
      * Significantly enhanced keyframe detection that is more aggressive about finding keyframes
      * This is especially important for stream transitions
