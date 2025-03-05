@@ -331,8 +331,8 @@ class WebTransportLoader extends BaseLoader {
 	     // Buffer settings
 	    bufferSizeInPackets: 800,              // Increase from 400 to 800
 	    minBufferSizeInPackets: 400,           // Increase from 200 to 400
-	    maxBufferSize: 1200,                   // Increase from 1000 to 1200
-	    forceDispatchThreshold: 1000,          // Increase from 600 to 1000
+	    maxBufferSize: 5200,                   // Increase from 1000 to 1200
+	    forceDispatchThreshold: 4000,          // Increase from 600 to 1000
 
             // Playback settings
             enablePTSContinuity: options.enablePTSContinuity !== undefined ? 
@@ -1204,10 +1204,17 @@ async _readStreamData(reader) {
         return isKeyframe;
     }
     
-
 /**
  * Enhanced _dispatchKeyframeAwareChunk method with improved stream transition handling
- * and more controlled buffer management to prevent overwhelming MSE
+ * and optimized for fast recovery during stream transitions.
+ * 
+ * Key optimizations:
+ * 1. Faster drain of active buffer during transitions
+ * 2. Faster initialization and cooldown periods
+ * 3. More aggressive dispatch during stream transitions
+ * 4. Adaptive dispatch rates based on buffer state
+ * 5. Uses larger chunks when safe to do so for faster recovery
+ * 6. Better handling of keyframe-aware dispatch during transitions
  */
 _dispatchKeyframeAwareChunk() {
     // Ensure _bufferState is initialized - this is a safety check
@@ -1239,8 +1246,8 @@ _dispatchKeyframeAwareChunk() {
     if (this._ptsHandler && this._ptsHandler._newStreamStarted) {
         const now = Date.now();
         
-        // Add a minimum time between transitions to prevent rapid transitions overwhelming MSE
-        const minTimeBetweenTransitions = 2000; // 2 seconds
+        // FAST RECOVERY: Shorter minimum time between transitions
+        const minTimeBetweenTransitions = 1000; // 1 second instead of 2 seconds
         
         if (this._bufferState.lastTransitionTime && 
             (now - this._bufferState.lastTransitionTime < minTimeBetweenTransitions)) {
@@ -1254,18 +1261,22 @@ _dispatchKeyframeAwareChunk() {
         this._bufferState.lastTransitionTime = now;
         Log.v(this.TAG, `Stream transition to stream #${this._bufferState.streamCounter} detected`);
         
+        // FAST RECOVERY: Check if we need to perform fast drain
+        // If current buffer is relatively empty, we can switch more quickly
+        const shouldFastDrain = this._bufferState.activeBuffer && 
+                                this._bufferState.activeBuffer.length < this.config.bufferSizeInPackets * 0.3;
+        
         // If this is our first stream (and init segments not saved yet), save a buffer snapshot
         if (this._bufferState.streamCounter === 2 && 
             !this._bufferState.savedInitSegments && 
-            this._bufferState.activeBuffer.length > 300) {
+            this._bufferState.activeBuffer.length > 200) {  // Lower threshold (200 instead of 300)
             
-            // Create a deep copy of initialization segments - better to only use first 500 packets
-            // as these are most likely to contain the init segments
-            const packetsToSave = Math.min(500, this._bufferState.activeBuffer.length);
+            // FAST RECOVERY: Only save the first 300 packets as init segments instead of 500
+            // This focuses on the earliest packets which are most likely to contain init segments
+            const packetsToSave = Math.min(300, this._bufferState.activeBuffer.length);
             this._bufferState.savedInitSegments = [];
             
             for (let i = 0; i < packetsToSave; i++) {
-                // Create a new copy of each packet
                 if (i < this._bufferState.activeBuffer.length) {
                     const packetCopy = new Uint8Array(this._bufferState.activeBuffer[i]);
                     this._bufferState.savedInitSegments.push(packetCopy);
@@ -1292,24 +1303,30 @@ _dispatchKeyframeAwareChunk() {
         this._dispatchErrorCount = 0;
         this._bufferState.mseErrorCount = 0;
         
-        Log.v(this.TAG, `Switched to pending buffer for stream #${this._bufferState.streamCounter}. Will drain active buffer first.`);
+        // FAST RECOVERY: If buffer is nearly empty, we can switch faster
+        if (shouldFastDrain) {
+            Log.v(this.TAG, `Fast transition: Active buffer is relatively empty (${this._bufferState.activeBuffer.length} packets), accelerating transition`);
+            // Will use more aggressive drain settings (handled in drain mode logic)
+        }
+        
+        Log.v(this.TAG, `Switched to pending buffer for stream #${this._bufferState.streamCounter}. Will ${shouldFastDrain ? 'quickly' : ''} drain active buffer first.`);
         
         return;
     }
     
     // SPECIAL HANDLING FOR DRAIN MODE
     if (this._bufferState.drainActive) {
-        // Check if active buffer is empty or near-empty (less than 50 packets)
-        if (!this._bufferState.activeBuffer || this._bufferState.activeBuffer.length <= 50) {
+        // Check if active buffer is empty or near-empty (less than 30 packets)
+        if (!this._bufferState.activeBuffer || this._bufferState.activeBuffer.length <= 30) {
             // Almost drained, prepare to switch to the pending buffer
             
             // 1. If we have saved init segments, queue them up to be sent first
             if (this._bufferState.savedInitSegments && this._bufferState.savedInitSegments.length > 0) {
                 Log.v(this.TAG, `Stream #${this._bufferState.streamCounter}: Preparing initialization (${this._bufferState.savedInitSegments.length} packets)`);
                 
-                // IMPROVEMENT: Send smaller batches of init segments (50 at a time instead of 200)
-                // to avoid overwhelming MSE during format change
-                const initChunkSize = Math.min(50, this._bufferState.savedInitSegments.length);
+                // FAST RECOVERY: Send larger batches of init segments (100 at a time) for faster recovery
+                // but ensure they're optimally sized to avoid overwhelming MSE
+                const initChunkSize = Math.min(100, this._bufferState.savedInitSegments.length);
                 const initSegmentsToSend = this._bufferState.savedInitSegments.slice(0, initChunkSize);
                 this._bufferState.savedInitSegments = this._bufferState.savedInitSegments.slice(initChunkSize);
                 
@@ -1329,21 +1346,21 @@ _dispatchKeyframeAwareChunk() {
                         this._onDataArrival(combinedBuffer.buffer, 0, combinedBuffer.byteLength);
                         Log.v(this.TAG, `Successfully sent ${totalSize} bytes of saved initialization data`);
                         
-                        // IMPROVEMENT: Add a small delay to allow MSE to process the data
+                        // FAST RECOVERY: Shorter delay to process faster
                         this._bufferState.lastDispatchTime = Date.now();
-                        this._bufferState.minDispatchInterval = 100; // 100ms delay
+                        this._bufferState.minDispatchInterval = 50; // 50ms delay instead of 100ms
                     } catch (e) {
                         Log.e(this.TAG, `Error sending saved init data: ${e.message}`);
                         this._bufferState.mseErrorCount++;
                         
                         // If multiple errors, abort the saved segments approach
-                        if (this._bufferState.mseErrorCount > 3) {
+                        if (this._bufferState.mseErrorCount > 2) { // Lower threshold for faster recovery
                             Log.w(this.TAG, `Too many errors with saved init segments, clearing them`);
                             this._bufferState.savedInitSegments = [];
                         } else {
-                            // Add a longer delay before next attempt
+                            // Shorter recovery time after error
                             this._bufferState.lastDispatchTime = Date.now();
-                            this._bufferState.minDispatchInterval = 500; // 500ms delay after error
+                            this._bufferState.minDispatchInterval = 250; // 250ms instead of 500ms
                         }
                     }
                 }
@@ -1372,11 +1389,14 @@ _dispatchKeyframeAwareChunk() {
             this._packetBuffer = this._bufferState.activeBuffer;
             this._keyframePositions = this._bufferState.activeKeyframePositions;
             
+            // FAST RECOVERY: Check if we have a large amount of data already and need immediate dispatch
+            const needsImmediateDispatch = this._packetBuffer.length > this.config.bufferSizeInPackets * 0.75;
+            
             // Exit drain mode
             this._bufferState.drainActive = false;
             this._bufferState.transitionPending = false;
             
-            // Set a cooldown period after transition to let MSE stabilize
+            // For fast recovery, use short cooldown period
             this._bufferState.cooldownActive = true;
             
             // Scan for keyframes in the new active buffer
@@ -1388,27 +1408,51 @@ _dispatchKeyframeAwareChunk() {
             
             Log.v(this.TAG, `Stream #${this._bufferState.streamCounter}: Transition complete, new buffer size: ${this._packetBuffer.length} packets`);
             
-            // Wait a longer time before dispatching from the new buffer to allow MSE to stabilize
+            // FAST RECOVERY: Shorter throttle time and faster cooldown period
             this._bufferState.lastDispatchTime = Date.now();
-            this._bufferState.minDispatchInterval = 250; // 250ms throttle for new stream
+            this._bufferState.minDispatchInterval = needsImmediateDispatch ? 50 : 100; // Faster 50-100ms throttle
             
-            // Set a timeout to exit cooldown mode after 2 seconds
+            // FAST RECOVERY: Shorter cooldown period (500ms instead of 2000ms)
             setTimeout(() => {
                 if (this._bufferState) {
                     this._bufferState.cooldownActive = false;
                     Log.v(this.TAG, `Stream #${this._bufferState.streamCounter}: Cooldown period ended`);
                 }
-            }, 2000);
+            }, 500);
+            
+            // FAST RECOVERY: If we have enough data already, dispatch immediately
+            if (needsImmediateDispatch && this._keyframePositions && this._keyframePositions.length > 0) {
+                Log.v(this.TAG, `Fast recovery: Buffer is ${Math.round(this._packetBuffer.length / this.config.bufferSizeInPackets * 100)}% full with ${this._keyframePositions.length} keyframes, dispatching immediately`);
+                
+                // Force dispatch of a reasonable chunk to start playback quickly
+                const firstKeyframe = this._keyframePositions[0];
+                const dispatchSize = Math.min(firstKeyframe > 0 ? firstKeyframe : 150, 150);
+                
+                setTimeout(() => {
+                    this._dispatchPacketChunk(dispatchSize);
+                }, 20); // Very short delay to allow MSE to initialize first
+            }
             
             return;
         }
         
-        // IMPROVEMENT: If we're still draining, focus on emptying the active buffer at a controlled rate
-        // Use a smaller drain chunk size to prevent overwhelming MSE
-        const drainChunkSize = Math.min(100, this._bufferState.activeBuffer ? this._bufferState.activeBuffer.length : 0);
+        // FAST RECOVERY: Use more aggressive draining approach
+        // If we have a lot of pending data, drain the active buffer faster
+        const pendingBufferSize = this._bufferState.pendingBuffer ? this._bufferState.pendingBuffer.length : 0;
+        const isPendingBufferLarge = pendingBufferSize > this.config.bufferSizeInPackets * 0.5;
+        
+        // Calculate optimal drain size based on pending buffer size
+        let drainChunkSize;
+        if (isPendingBufferLarge) {
+            // Drain faster if we have a lot of pending data
+            drainChunkSize = Math.min(150, this._bufferState.activeBuffer ? this._bufferState.activeBuffer.length : 0);
+        } else {
+            // Standard drain rate
+            drainChunkSize = Math.min(100, this._bufferState.activeBuffer ? this._bufferState.activeBuffer.length : 0);
+        }
         
         if (drainChunkSize > 0) {
-            Log.v(this.TAG, `Draining active buffer: ${drainChunkSize} packets, ${this._bufferState.activeBuffer.length - drainChunkSize} remaining`);
+            Log.v(this.TAG, `Draining active buffer: ${drainChunkSize} packets, ${this._bufferState.activeBuffer.length - drainChunkSize} remaining${isPendingBufferLarge ? ' (accelerated drain)' : ''}`);
             
             // Keep a reference to the current buffer setup
             const currentPacketBuffer = this._packetBuffer;
@@ -1430,9 +1474,9 @@ _dispatchKeyframeAwareChunk() {
             this._packetBuffer = currentPacketBuffer;
             this._keyframePositions = currentKeyframePositions;
             
-            // IMPROVEMENT: Add a longer delay between drain chunks to prevent overwhelming MSE
+            // FAST RECOVERY: Shorter interval between drain chunks
             this._bufferState.lastDispatchTime = Date.now();
-            this._bufferState.minDispatchInterval = 200; // 200ms between drain chunks
+            this._bufferState.minDispatchInterval = isPendingBufferLarge ? 75 : 150; // 75-150ms between chunks
             
             return;
         }
@@ -1448,13 +1492,19 @@ _dispatchKeyframeAwareChunk() {
         return;
     }
     
-    // IMPROVEMENT: Adjust dispatch interval based on buffer fullness and cooldown state
+    // FAST RECOVERY: More aggressive throttling strategy
     if (this._bufferState.cooldownActive) {
-        // During cooldown after transition, enforce longer intervals
-        this._bufferState.minDispatchInterval = 150; // 150ms minimum during cooldown
+        // During cooldown after transition, use shorter intervals for faster recovery
+        this._bufferState.minDispatchInterval = 75; // 75ms instead of 150ms during cooldown
+    } else if (this._packetBuffer && this._packetBuffer.length > this.config.forceDispatchThreshold * 0.9) {
+        // Critical buffer level - dispatch as fast as safely possible
+        this._bufferState.minDispatchInterval = 30; // 30ms for critically full buffer
     } else if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
         // Very full buffer - dispatch faster
         this._bufferState.minDispatchInterval = 50; // 50ms for very full buffer
+    } else if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
+        // Moderately full buffer - dispatch at medium pace
+        this._bufferState.minDispatchInterval = 75; // 75ms for moderately full buffer
     } else {
         // Normal operation
         this._bufferState.minDispatchInterval = 0; // No artificial delay during normal operation
@@ -1468,20 +1518,78 @@ _dispatchKeyframeAwareChunk() {
         Log.v(this.TAG, `No keyframes in buffer of ${this._packetBuffer.length} packets. Forcing keyframe scan.`);
         this._rescanBufferForKeyframes();
         
+        // FAST RECOVERY: Check transition state
+        const isTransitioning = this._bufferState.cooldownActive || this._bufferState.transitionPending;
+        const isCriticallyFull = this._packetBuffer && 
+                                this._packetBuffer.length > this.config.forceDispatchThreshold * 0.9;
+        
+        // FAST RECOVERY: Lower threshold during transitions (1.1 instead of 1.2)
+        const bufferThreshold = isTransitioning ? 1.1 : 1.2;
+        
         // If still no keyframes, dispatch a reasonable amount
         if ((!this._keyframePositions || this._keyframePositions.length === 0) && 
-            this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
+            this._packetBuffer.length > this.config.bufferSizeInPackets * bufferThreshold) {
             
-            // IMPROVEMENT: Dispatch smaller chunks to avoid overwhelming MSE
-            // Calculate a dispatch size that's proportional to buffer size but capped
+            // FAST RECOVERY: Adjust dispatch size based on state
+            let dispatchRatio, maxDispatchSize;
+            
+            if (isTransitioning) {
+                // During transition, dispatch more data
+                dispatchRatio = 1/3; // 33% instead of 25%
+                maxDispatchSize = 200; // Higher max during transition
+            } else if (isCriticallyFull) {
+                // Critical buffer level
+                dispatchRatio = 0.3; // 30%
+                maxDispatchSize = 175; // Higher than normal, lower than transition
+            } else {
+                // Standard operation
+                dispatchRatio = 0.25; // 25%
+                maxDispatchSize = 150; // Standard max
+            }
+            
             const packetsToDispatch = Math.min(
-                Math.floor(this._packetBuffer.length / 4), // 25% of buffer instead of 33%
-                150 // Max 150 packets instead of 300
+                Math.floor(this._packetBuffer.length * dispatchRatio),
+                maxDispatchSize
             );
             
-            Log.v(this.TAG, `Still no keyframes after scan. Dispatching ${Math.floor(packetsToDispatch)} packets.`);
+            Log.v(this.TAG, `Still no keyframes after scan. Dispatching ${Math.floor(packetsToDispatch)} packets` +
+                  (isTransitioning ? ' (accelerated during transition)' : '') +
+                  (isCriticallyFull ? ' (accelerated for critical buffer)' : '') + '.');
+            
             this._dispatchPacketChunk(Math.floor(packetsToDispatch));
+            
+            // FAST RECOVERY: Set appropriate dispatch interval
             this._bufferState.lastDispatchTime = now;
+            if (isTransitioning || isCriticallyFull) {
+                this._bufferState.minDispatchInterval = 40; // Faster recovery during transition/critical
+            } else {
+                this._bufferState.minDispatchInterval = 75; // Standard interval
+            }
+            
+            // FAST RECOVERY: During transition, try a second dispatch immediately if needed
+            if (isTransitioning && this._packetBuffer && 
+                this._packetBuffer.length > this.config.bufferSizeInPackets * 1.5) {
+                
+                // Schedule another dispatch shortly after
+                setTimeout(() => {
+                    try {
+                        if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets) {
+                            Log.v(this.TAG, `Fast recovery: Secondary dispatch to accelerate transition`);
+                            // Try another scan for keyframes
+                            this._rescanBufferForKeyframes();
+                            // Dispatch additional packets 
+                            const secondDispatchSize = Math.min(100, Math.floor(this._packetBuffer.length * 0.2));
+                            if (secondDispatchSize > 0) {
+                                this._dispatchPacketChunk(secondDispatchSize);
+                            }
+                        }
+                    } catch (e) {
+                        // Ignore errors during secondary dispatch - it's optional
+                        Log.w(this.TAG, `Error during secondary dispatch: ${e.message}`);
+                    }
+                }, 80); // Short delay
+            }
+            
             return;
         }
     }
@@ -1491,12 +1599,42 @@ _dispatchKeyframeAwareChunk() {
         let startKeyframeIndex = 0;
         const startPos = this._keyframePositions[startKeyframeIndex];
         
-        // In most cases, we'll just dispatch from first keyframe to second keyframe
-        const endKeyframeIndex = 1;
-        const endPos = this._keyframePositions[endKeyframeIndex];
+        // FAST RECOVERY: Consider dispatching multiple keyframes during transition
+        let endKeyframeIndex = 1;
+        let endPos = this._keyframePositions[endKeyframeIndex];
         
-        // IMPROVEMENT: Check if the segment is too large and limit if needed
-        const packetsToDispatch = Math.min(endPos, 200); // Cap at 200 packets per dispatch
+        // During cooldown or immediately after stream transition, try to dispatch more data
+        if ((this._bufferState.cooldownActive || this._bufferState.transitionPending) && 
+            numKeyframes > 2 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
+            
+            // Find an optimal keyframe to dispatch up to (try to dispatch more data during transition)
+            for (let i = 2; i < Math.min(4, numKeyframes); i++) {
+                const candidatePos = this._keyframePositions[i];
+                // If next keyframe would result in a reasonable dispatch size
+                if (candidatePos < 350) {
+                    endKeyframeIndex = i;
+                    endPos = candidatePos;
+                    
+                    // If we already found a good candidate, no need to keep searching
+                    if (endPos > 150) break;
+                }
+            }
+            
+            if (endKeyframeIndex > 1) {
+                Log.v(this.TAG, `Fast recovery: Dispatching extended segment (${endKeyframeIndex} keyframes)`);
+            }
+        }
+        
+        // Determine dispatch size, accounting for maximum safe packet count and transitions
+        let maxDispatchSize = 2000; // Default cap
+        
+        // FAST RECOVERY: During cooldown, allow larger dispatches if we have many keyframes
+        if (this._bufferState.cooldownActive && numKeyframes > 3) {
+            maxDispatchSize = 3000; // Larger size during cooldown with healthy keyframe count
+        }
+        
+        // Cap dispatch size and handle partial dispatches
+        const packetsToDispatch = Math.min(endPos, maxDispatchSize);
         
         if (this.config.enableDetailedLogging || packetsToDispatch !== endPos) {
             Log.v(this.TAG, `Keyframe-aware dispatch: from keyframe ${startKeyframeIndex} to ${endKeyframeIndex} ` +
@@ -1504,13 +1642,26 @@ _dispatchKeyframeAwareChunk() {
                  `maintaining ${this._packetBuffer.length - packetsToDispatch} in buffer`);
         }
         
+        // FAST RECOVERY: Check for critical conditions
+        const isCriticallyFull = this._packetBuffer.length > this.config.forceDispatchThreshold * 0.95;
+        const isTransitioning = this._bufferState.cooldownActive || this._bufferState.transitionPending;
+        
         // Dispatch the segment (or part of it if capped)
         this._dispatchPacketChunk(packetsToDispatch);
+        
+        // FAST RECOVERY: Set appropriate dispatch interval based on situation
         this._bufferState.lastDispatchTime = now;
+        if (isCriticallyFull) {
+            this._bufferState.minDispatchInterval = 30; // Very short delay for critically full buffer
+        } else if (isTransitioning) {
+            this._bufferState.minDispatchInterval = 50; // Short delay during transitions
+        } else {
+            this._bufferState.minDispatchInterval = 75; // Standard delay
+        }
         
         // Update keyframe positions to account for removed packets
         if (packetsToDispatch === endPos) {
-            // If we dispatched the entire segment, remove the first keyframe
+            // If we dispatched the entire segment, remove up to the dispatched keyframe
             this._keyframePositions = this._keyframePositions
                 .slice(endKeyframeIndex)
                 .map(pos => pos - endPos)
@@ -1529,35 +1680,90 @@ _dispatchKeyframeAwareChunk() {
     if (numKeyframes === 1) {
         const keyframePos = this._keyframePositions[0];
         
+        // FAST RECOVERY: Check if we're in transition or critical state
+        const isTransitioning = this._bufferState.cooldownActive || this._bufferState.transitionPending;
+        const isCriticallyFull = this._packetBuffer && 
+                                this._packetBuffer.length > this.config.forceDispatchThreshold * 0.9;
+        
         // If the keyframe is not at the beginning, dispatch data up to the keyframe
         if (keyframePos > 0) {
-            // IMPROVEMENT: Cap the dispatch size to avoid overwhelming MSE
-            const packetsToDispatch = Math.min(keyframePos, 150);
+            // FAST RECOVERY: Determine dispatch size based on current state
+            let maxDispatchSize;
             
-            Log.v(this.TAG, `Dispatching ${packetsToDispatch}${packetsToDispatch !== keyframePos ? ' of ' + keyframePos : ''} packets before keyframe`);
-            this._dispatchPacketChunk(packetsToDispatch);
+            if (isTransitioning) {
+                // During transition, use larger chunks for faster recovery
+                maxDispatchSize = Math.min(200, keyframePos);
+            } else if (isCriticallyFull) {
+                // If critically full, dispatch faster to catch up
+                maxDispatchSize = Math.min(175, keyframePos);
+            } else {
+                // Standard operation
+                maxDispatchSize = Math.min(150, keyframePos);
+            }
+            
+            Log.v(this.TAG, `Dispatching ${maxDispatchSize}${maxDispatchSize !== keyframePos ? ' of ' + keyframePos : ''} packets before keyframe` +
+                  (isTransitioning ? ' (accelerated during transition)' : '') +
+                  (isCriticallyFull ? ' (accelerated for critical buffer)' : ''));
+            
+            this._dispatchPacketChunk(maxDispatchSize);
+            
+            // FAST RECOVERY: Set appropriate dispatch interval
             this._bufferState.lastDispatchTime = now;
+            if (isTransitioning || isCriticallyFull) {
+                this._bufferState.minDispatchInterval = 40; // Faster recovery during transition/critical state
+            } else {
+                this._bufferState.minDispatchInterval = 75; // Standard interval
+            }
             
             // Update keyframe positions
-            if (packetsToDispatch === keyframePos) {
+            if (maxDispatchSize === keyframePos) {
                 this._keyframePositions[0] = 0;
             } else {
-                this._keyframePositions[0] = keyframePos - packetsToDispatch;
+                this._keyframePositions[0] = keyframePos - maxDispatchSize;
             }
             return;
         }
         
         // If buffer is getting too large with just one keyframe, dispatch some data
-        if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
-            // IMPROVEMENT: Use smaller dispatch size
+        // FAST RECOVERY: Lower threshold for action during transitions (1.1 instead of 1.2)
+        const bufferThreshold = isTransitioning ? 1.1 : 1.2;
+        
+        if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets * bufferThreshold) {
+            // FAST RECOVERY: Calculate dispatch size based on state
+            let dispatchRatio, maxDispatchSize;
+            
+            if (isTransitioning) {
+                // During transition, dispatch more data
+                dispatchRatio = 1/3; // 33% instead of 25%
+                maxDispatchSize = 150; // Higher max during transition
+            } else if (isCriticallyFull) {
+                // Critical buffer level
+                dispatchRatio = 0.3; // 30%
+                maxDispatchSize = 130; // Higher than normal, lower than transition
+            } else {
+                // Standard operation
+                dispatchRatio = 0.25; // 25%
+                maxDispatchSize = 100; // Standard max
+            }
+            
             const packetsToDispatch = Math.min(
-                Math.floor(this._packetBuffer.length / 4), // 25% instead of 33%
-                100 // Max 100 packets instead of 250
+                Math.floor(this._packetBuffer.length * dispatchRatio),
+                maxDispatchSize
             );
             
-            Log.v(this.TAG, `Buffer large with one keyframe. Dispatching ${packetsToDispatch} packets.`);
+            Log.v(this.TAG, `Buffer large with one keyframe. Dispatching ${packetsToDispatch} packets` +
+                  (isTransitioning ? ' (accelerated during transition)' : '') +
+                  (isCriticallyFull ? ' (accelerated for critical buffer)' : '') + '.');
+            
             this._dispatchPacketChunk(packetsToDispatch);
+            
+            // FAST RECOVERY: Set appropriate dispatch interval
             this._bufferState.lastDispatchTime = now;
+            if (isTransitioning || isCriticallyFull) {
+                this._bufferState.minDispatchInterval = 40; // Faster recovery during transition/critical state
+            } else {
+                this._bufferState.minDispatchInterval = 75; // Standard interval
+            }
             
             // Reset keyframe positions and scan again
             this._keyframePositions = [];
@@ -1568,24 +1774,47 @@ _dispatchKeyframeAwareChunk() {
     
     // Force dispatch if buffer exceeds threshold, but with better control
     if (this._packetBuffer && this._packetBuffer.length > this.config.forceDispatchThreshold) {
-        // IMPROVEMENT: More controlled dispatch size based on how full the buffer is
+        // FAST RECOVERY: More aggressive dispatch to handle buffer overflow
+        const isTransitioning = this._bufferState.cooldownActive || this._bufferState.transitionPending;
+        
+        // Calculate dispatch size based on whether we're in a transition and how full the buffer is
         let excessRatio = (this._packetBuffer.length - this.config.bufferSizeInPackets) / 
                           (this.config.forceDispatchThreshold - this.config.bufferSizeInPackets);
         
-        // Clamp ratio between 0.2 and 1.0
-        excessRatio = Math.max(0.2, Math.min(1.0, excessRatio));
+        // During transitions, use more aggressive ratios
+        if (isTransitioning) {
+            // Larger minimum ratio (0.4 instead of 0.2) during transitions
+            excessRatio = Math.max(0.4, Math.min(1.0, excessRatio));
+            
+            // Increase the excessRatio by 20% during transitions for faster recovery
+            excessRatio = Math.min(1.0, excessRatio * 1.2);
+        } else {
+            // Normal operation - standard ratio clamping
+            excessRatio = Math.max(0.2, Math.min(1.0, excessRatio));
+        }
+        
+        // FAST RECOVERY: Higher maximum dispatch size during transitions
+        const maxDispatchSize = isTransitioning ? 200 : 150;
         
         // Calculate dispatch size based on excess ratio - more excess = larger dispatch
         const baseDispatchSize = Math.min(
             Math.ceil((this._packetBuffer.length - this.config.bufferSizeInPackets) * excessRatio),
-            150 // Max 150 packets instead of 300
+            maxDispatchSize
         );
         
         Log.v(this.TAG, `Buffer exceeding threshold (${this._packetBuffer.length}/${this.config.forceDispatchThreshold}). ` +
-             `Forcing dispatch of ${baseDispatchSize} packets (${Math.round(excessRatio * 100)}% of excess).`);
+             `Forcing dispatch of ${baseDispatchSize} packets (${Math.round(excessRatio * 100)}% of excess)` +
+             (isTransitioning ? ' (accelerated during transition)' : '') + '.');
         
         this._dispatchPacketChunk(baseDispatchSize);
+        
+        // FAST RECOVERY: Shorter delay after forced dispatch during transitions
         this._bufferState.lastDispatchTime = now;
+        if (isTransitioning) {
+            this._bufferState.minDispatchInterval = 50; // 50ms during transitions
+        } else {
+            this._bufferState.minDispatchInterval = 100; // 100ms during normal operation
+        }
         
         // Reset keyframe detection after forced dispatch
         this._keyframePositions = [];
@@ -1684,7 +1913,7 @@ _processChunk(chunk) {
                             // or if we're in drain mode
                             if ((!isInTransition || isActiveBuffer) && !isDraining) {
                                 // Normal dispatch for active buffer when not in transition
-                                const packetsToDispatch = Math.min(300, currentBufferSize - this.config.bufferSizeInPackets);
+                                const packetsToDispatch = Math.min(3000, currentBufferSize - this.config.bufferSizeInPackets);
                                 Log.v(this.TAG, `Large buffer (${currentBufferSize} packets). Dispatching ${packetsToDispatch} packets.`);
                                 this._dispatchPacketChunk(packetsToDispatch);
                             } else if (isDraining) {
@@ -1697,7 +1926,7 @@ _processChunk(chunk) {
                             }
                         } else {
                             // Fallback if buffer state is missing
-                            const packetsToDispatch = Math.min(300, currentBufferSize - this.config.bufferSizeInPackets);
+                            const packetsToDispatch = Math.min(3000, currentBufferSize - this.config.bufferSizeInPackets);
                             Log.v(this.TAG, `Buffer state missing. Dispatching ${packetsToDispatch} packets from buffer.`);
                             this._dispatchPacketChunk(packetsToDispatch);
                         }
