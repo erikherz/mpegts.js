@@ -1042,90 +1042,98 @@ async _readStreamData(reader) {
     
 
 	_dispatchKeyframeAwareChunk() {
-	    // Initialize state variables if they don't exist yet
-	    if (this._savedInitData === undefined) {
-		this._savedInitData = null;
-		this._firstStreamSeen = false;
-		this._pendingStreamReset = false;
-		this._inStreamTransition = false;
+	    // Initialize state tracking variables if they don't exist yet
+	    if (this._savedInitSegments === undefined) {
+		// Storage for initialization segments
+		this._savedInitSegments = null;
+		// Flag to track if we're after a stream transition
+		this._streamTransitionPending = false;
+		// Stream counter to track which stream we're on
+		this._streamCounter = 1;
 	    }
 	    
-	    // STREAM TRANSITION HANDLING
-	    if (this._ptsHandler._newStreamStarted || this._pendingStreamReset) {
-		// If this is our first stream and we haven't saved init data yet
-		if (!this._firstStreamSeen && this._packetBuffer.length > 400) {
-		    // Save a substantial chunk of the first stream for future initialization
-		    const saveSize = Math.min(800, this._packetBuffer.length);
-		    this._savedInitData = this._packetBuffer.slice(0, saveSize).map(p => new Uint8Array(p));
-		    Log.v(this.TAG, `Saved ${saveSize} packets from first stream for future initialization`);
-		    this._firstStreamSeen = true;
+	    // HANDLE STREAM TRANSITION
+	    if (this._ptsHandler._newStreamStarted) {
+		this._streamCounter++;
+		Log.v(this.TAG, `Stream transition to stream #${this._streamCounter} detected`);
+		
+		// If this is our first stream (and init segments not saved yet), save a buffer snapshot
+		if (this._streamCounter === 2 && !this._savedInitSegments && this._packetBuffer.length > 300) {
+		    // Create a deep copy of current buffer - focusing on early packets that have init data
+		    const packetsToSave = Math.min(800, this._packetBuffer.length);
+		    this._savedInitSegments = [];
+		    
+		    for (let i = 0; i < packetsToSave; i++) {
+			// Create a new copy of each packet
+			const packetCopy = new Uint8Array(this._packetBuffer[i]);
+			this._savedInitSegments.push(packetCopy);
+		    }
+		    
+		    Log.v(this.TAG, `Saved ${packetsToSave} packets from first stream for future initialization`);
 		}
 		
-		// Clear the buffer and state
+		// Set the transition pending flag
+		this._streamTransitionPending = true;
+		
+		// Reset buffer state for a clean start
 		this._packetBuffer = [];
 		this._keyframePositions = [];
-		this._inStreamTransition = true;
-		this._pendingStreamReset = false;
 		
 		// Clear the PTS handler flag immediately
 		this._ptsHandler._newStreamStarted = false;
 		
-		Log.v(this.TAG, "Stream transition: Buffer reset complete");
-		
-		// Return immediately to wait for more data
 		return;
 	    }
 	    
-	    // HANDLE POST-STREAM TRANSITION
-	    if (this._inStreamTransition) {
-		// Wait for enough data to accumulate
+	    // SPECIAL HANDLING FOR PENDING STREAM TRANSITION
+	    if (this._streamTransitionPending) {
+		// First, wait to get enough data (at least 300 packets)
 		if (this._packetBuffer.length < 300) {
 		    if (this._packetBuffer.length % 50 === 0) {
-			Log.v(this.TAG, `Post-transition: Accumulating data (${this._packetBuffer.length}/300 packets)`);
+			Log.v(this.TAG, `Stream #${this._streamCounter}: Accumulating data (${this._packetBuffer.length}/300 packets)`);
 		    }
 		    return;
 		}
 		
-		// If we have saved initialization data, send it first
-		if (this._savedInitData && this._savedInitData.length > 0) {
-		    Log.v(this.TAG, `Post-transition: Sending saved init data (${this._savedInitData.length} packets)`);
+		// If we have saved init segments, send them first
+		if (this._savedInitSegments && this._savedInitSegments.length > 0) {
+		    Log.v(this.TAG, `Stream #${this._streamCounter}: Sending ${this._savedInitSegments.length} saved initialization packets`);
 		    
-		    // Create a combined packet from the saved data
-		    const totalLength = this._savedInitData.reduce((sum, packet) => sum + packet.length, 0);
-		    const initChunk = new Uint8Array(totalLength);
+		    // Create a combined buffer from all saved packets
+		    const totalSize = this._savedInitSegments.reduce((sum, p) => sum + p.byteLength, 0);
+		    const combinedBuffer = new Uint8Array(totalSize);
 		    
 		    let offset = 0;
-		    for (const packet of this._savedInitData) {
-			initChunk.set(packet, offset);
-			offset += packet.length;
+		    for (const packet of this._savedInitSegments) {
+			combinedBuffer.set(packet, offset);
+			offset += packet.byteLength;
 		    }
 		    
-		    // Send the init data
+		    // Send the saved init segments
 		    if (this._onDataArrival) {
 			try {
-			    this._onDataArrival(initChunk.buffer, 0, initChunk.byteLength);
-			    Log.v(this.TAG, `Sent ${initChunk.byteLength} bytes of saved initialization data`);
+			    this._onDataArrival(combinedBuffer.buffer, 0, combinedBuffer.byteLength);
+			    Log.v(this.TAG, `Successfully sent ${totalSize} bytes of saved initialization data`);
 			} catch (e) {
-			    Log.e(this.TAG, `Error sending init data: ${e.message}`);
+			    Log.e(this.TAG, `Error sending saved init data: ${e.message}`);
 			}
 		    }
-		} else {
-		    Log.w(this.TAG, "No saved initialization data available");
 		}
 		
-		// Reset the transition flag
-		this._inStreamTransition = false;
+		// Clear the transition pending flag
+		this._streamTransitionPending = false;
 		
-		// Continue with normal processing
+		// Scan for keyframes in current buffer
 		this._rescanBufferForKeyframes();
 		
-		Log.v(this.TAG, "Post-transition initialization complete, resuming normal operation");
+		// Continue with normal operation
+		Log.v(this.TAG, `Stream #${this._streamCounter}: Post-transition initialization complete`);
 		
-		// Don't dispatch packets this cycle to avoid overwhelming the pipeline
+		// Don't dispatch anything more this cycle
 		return;
 	    }
 	    
-	    // STANDARD OPERATION - SAFETY CHECK
+	    // SAFETY CHECK - If buffer is extremely large, force non-keyframe dispatch
 	    if (this._packetBuffer.length > 1500) {
 		// Critical situation - force dispatch regardless of keyframes
 		const packetsToDispatch = Math.min(this._packetBuffer.length - 400, 1000);
