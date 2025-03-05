@@ -321,6 +321,7 @@ class WebTransportLoader extends BaseLoader {
 	this._savedInitSegments = { video: null, audio: null };
 	this._hasReceivedInitSegments = false;
 
+
         // Configure settings with option overrides
         this.config = {
             // Logging
@@ -402,7 +403,50 @@ class WebTransportLoader extends BaseLoader {
         // Performance monitoring
         this._lastPerformanceCheck = Date.now();
         this._setupPerformanceMonitoring();
+
+	    this._bufferState = {
+		// Currently active buffer (being dispatched)
+		activeBuffer: this._packetBuffer,
+		// Buffer for the next stream (pending)
+		pendingBuffer: [],
+		// Track keyframes for each buffer
+		activeKeyframePositions: this._keyframePositions || [],
+		pendingKeyframePositions: [],
+		// Stream counters and state tracking
+		streamCounter: 1,
+		transitionPending: false,
+		drainActive: false,
+		// Store initialization segments for potential reuse
+		savedInitSegments: null,
+		// Delay between dispatches to throttle during high load
+		lastDispatchTime: 0,
+		minDispatchInterval: 0
+	    };
+
     }
+
+
+	resetBufferState() {
+	    // Reset the buffer state to initial values
+	    this._packetBuffer = [];
+	    this._keyframePositions = [];
+	    
+	    this._bufferState = {
+		activeBuffer: this._packetBuffer,
+		pendingBuffer: [],
+		activeKeyframePositions: [],
+		pendingKeyframePositions: [],
+		streamCounter: 1,
+		transitionPending: false,
+		drainActive: false,
+		savedInitSegments: null,
+		lastDispatchTime: 0,
+		minDispatchInterval: 0
+	    };
+	    
+	    this._initialBufferingComplete = false;
+	    Log.v(this.TAG, "Buffer state has been reset");
+	}
 
     /**
      * Set up performance monitoring for adaptive buffer management
@@ -669,63 +713,183 @@ class WebTransportLoader extends BaseLoader {
         }
     }
 
-    async open(dataSource) {
+/**
+ * Opens a WebTransport connection and starts streaming
+ * Enhanced with better initialization and error handling
+ * 
+ * @param {Object} dataSource The data source with URL and potentially other properties
+ * @returns {Promise} Resolves when setup is complete, rejects on error
+ */
+async open(dataSource) {
+    try {
+        // Validate input
+        if (!dataSource || !dataSource.url) {
+            throw new Error('Invalid data source, URL is required');
+        }
+
+        if (!dataSource.url.startsWith('https://')) {
+            throw new Error('WebTransport requires HTTPS URL');
+        }
+
+        Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
+
+        // Reset state before opening a new connection
+        this._requestAbort = false;
+        this._receivedLength = 0;
+        this._initialBufferingComplete = false;
+        
+        // Reset diagnostics
+        this.stats = {
+            totalBytesReceived: 0,
+            totalPacketsProcessed: 0,
+            streamsReceived: 0,
+            lastPTS: {
+                video: null,
+                audio: null
+            },
+            ptsAdjustments: {
+                video: 0,
+                audio: 0
+            },
+            bufferFullness: 0,
+            maxBufferSize: this.config.maxBufferSize,
+            keyframesDetected: 0,
+            chunksDispatched: 0,
+            
+            // Performance metrics
+            dispatchHistory: [],        // Array of dispatch timestamps and sizes
+            networkCondition: 'good',   // 'good', 'variable', or 'poor'
+            avgDispatchRate: 0,         // Average packets per second
+            avgDispatchSize: 0,         // Average dispatch size
+            lastDispatchTime: 0,        // Last dispatch timestamp
+            
+            // Network metrics
+            bytesPerSecond: 0,
+            packetJitter: 0,            // Variability in packet arrival time
+            streamTransitionCount: 0    // Number of stream transitions
+        };
+        
+        // Reset buffer state completely
+        this._resetBufferState();
+        
+        // Reset error tracking
+        this._dispatchErrorCount = 0;
+        this._dispatchErrorBackoffTime = 0;
+
+        // Create WebTransport connection
         try {
-            if (!dataSource.url.startsWith('https://')) {
-                throw new Error('WebTransport requires HTTPS URL');
-            }
-
-            Log.v(this.TAG, `Opening WebTransport connection to ${dataSource.url}`);
-
-            // Create WebTransport connection
             this._transport = new WebTransport(dataSource.url);
             await this._transport.ready;
+        } catch (connError) {
+            // Enhanced error for connection issues
+            throw new Error(`Failed to establish WebTransport connection: ${connError.message}`);
+        }
 
-            // Set up error and close handlers
-            this._transport.closed.then(info => {
-                Log.v(this.TAG, `WebTransport connection closed: ${JSON.stringify(info)}`);
-                if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError) {
-                    this._status = LoaderStatus.kError;
-                    if (this._onError) {
-                        this._onError(LoaderErrors.CONNECTION_ERROR, {
-                            code: -1,
-                            msg: `WebTransport connection closed: ${JSON.stringify(info)}`
-                        });
-                    }
+        // Set up error and close handlers with better error reporting
+        this._transport.closed.then(info => {
+            const closeCode = info && info.closeCode ? info.closeCode : 'unknown';
+            const closeReason = info && info.reason ? info.reason : 'Connection closed';
+            
+            Log.v(this.TAG, `WebTransport connection closed: code=${closeCode}, reason=${closeReason}`);
+            
+            if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError) {
+                this._status = LoaderStatus.kError;
+                if (this._onError) {
+                    this._onError(LoaderErrors.CONNECTION_ERROR, {
+                        code: closeCode,
+                        msg: `WebTransport connection closed: ${closeReason}`
+                    });
                 }
-            }).catch(error => {
-                Log.e(this.TAG, `WebTransport connection error: ${error.message}`);
-            });
+            }
+        }).catch(error => {
+            Log.e(this.TAG, `WebTransport connection error: ${error.message}`);
+            
+            // Only trigger error if we're not already in an error state or completed state
+            if (this._status !== LoaderStatus.kComplete && this._status !== LoaderStatus.kError && this._onError) {
+                this._status = LoaderStatus.kError;
+                this._onError(LoaderErrors.CONNECTION_ERROR, {
+                    code: error.code || -1,
+                    msg: `WebTransport connection error: ${error.message}`
+                });
+            }
+        });
 
-            // Start processing incoming streams
-            this._status = LoaderStatus.kBuffering;
+        // Start processing incoming streams
+        this._status = LoaderStatus.kBuffering;
+        
+        try {
             this._streamReader = this._transport.incomingUnidirectionalStreams.getReader();
+        } catch (streamError) {
+            throw new Error(`Failed to get stream reader: ${streamError.message}`);
+        }
 
-            // Reset buffer state
-            this._packetBuffer = [];
-            this._initialBufferingComplete = false;
-            this.stats.maxBufferSize = this.config.bufferSizeInPackets;
+        // Initialize PTS continuity handler if enabled
+        if (this.config.enablePTSContinuity && this._ptsHandler) {
+            this._ptsHandler.reset();
+            this._ptsHandler.enableDetailedLogging = this.config.enableDetailedLogging;
+        }
 
-            // Start processing streams
-            this._processStreams();
+        // Start processing streams
+        this._processStreams().catch(e => {
+            // Only log if not aborted - aborts throw errors that we expect
+            if (!this._requestAbort) {
+                Log.e(this.TAG, `Error in stream processing: ${e.message}`);
+            }
+        });
 
-            // Set up diagnostics timer if needed
-            this.diagnosticTimer = setInterval(() => {
+        // Set up diagnostics timer if needed, with cleanup on error
+        if (this.diagnosticTimer) {
+            clearInterval(this.diagnosticTimer);
+            this.diagnosticTimer = null;
+        }
+        
+        this.diagnosticTimer = setInterval(() => {
+            try {
                 this._logDiagnostics();
 
                 // Check for PTS continuity reset conditions
-                if (this.config.enablePTSContinuity) {
+                if (this.config.enablePTSContinuity && this._ptsHandler) {
                     this._ptsHandler.checkForResetConditions();
                 }
-            }, 10000);
-
-        } catch (e) {
-            this._status = LoaderStatus.kError;
-            if (this._onError) {
-                this._onError(LoaderErrors.EXCEPTION, { code: e.code || -1, msg: e.message });
+            } catch (diagError) {
+                Log.w(this.TAG, `Error in diagnostics: ${diagError.message}`);
+                // Don't let diagnostic errors affect the main functionality
             }
+        }, 10000);
+
+        return true; // Successful setup
+
+    } catch (e) {
+        // Ensure we clean up any resources on error
+        this._status = LoaderStatus.kError;
+        
+        // Close transport if it was created
+        if (this._transport && !this._transport.closed) {
+            try {
+                await this._transport.close().catch(() => {});
+            } catch (closeError) {
+                // Ignore close errors during error cleanup
+            }
+            this._transport = null;
         }
+        
+        // Clear any timers
+        if (this.diagnosticTimer) {
+            clearInterval(this.diagnosticTimer);
+            this.diagnosticTimer = null;
+        }
+        
+        // Notify error callback
+        if (this._onError) {
+            this._onError(LoaderErrors.EXCEPTION, { 
+                code: e.code || -1, 
+                msg: `Error opening WebTransport: ${e.message}` 
+            });
+        }
+        
+        throw e; // Re-throw for caller to handle
     }
+}
 
     async _processStreams() {
         try {
@@ -1042,24 +1206,18 @@ async _readStreamData(reader) {
     
 
 _dispatchKeyframeAwareChunk() {
-    // Initialize state tracking variables if they don't exist yet
-    if (this._bufferState === undefined) {
-        // Initialize dual buffer system
+    // Ensure _bufferState is initialized - this is a safety check
+    // in case this method is called before initialization
+    if (!this._bufferState) {
         this._bufferState = {
-            // Currently active buffer (being dispatched)
             activeBuffer: this._packetBuffer,
-            // Buffer for the next stream (pending)
             pendingBuffer: [],
-            // Track keyframes for each buffer
             activeKeyframePositions: this._keyframePositions || [],
             pendingKeyframePositions: [],
-            // Stream counters and state tracking
             streamCounter: 1,
             transitionPending: false,
             drainActive: false,
-            // Store initialization segments for potential reuse
             savedInitSegments: null,
-            // Delay between dispatches to throttle during high load
             lastDispatchTime: 0,
             minDispatchInterval: 0
         };
@@ -1070,23 +1228,28 @@ _dispatchKeyframeAwareChunk() {
     }
     
     // HANDLE STREAM TRANSITION
-    if (this._ptsHandler._newStreamStarted) {
+    if (this._ptsHandler && this._ptsHandler._newStreamStarted) {
         this._bufferState.streamCounter++;
         Log.v(this.TAG, `Stream transition to stream #${this._bufferState.streamCounter} detected`);
         
         // If this is our first stream (and init segments not saved yet), save a buffer snapshot
-        if (this._bufferState.streamCounter === 2 && !this._bufferState.savedInitSegments && this._bufferState.activeBuffer.length > 300) {
+        if (this._bufferState.streamCounter === 2 && 
+            !this._bufferState.savedInitSegments && 
+            this._bufferState.activeBuffer.length > 300) {
+            
             // Create a deep copy of initialization segments
             const packetsToSave = Math.min(800, this._bufferState.activeBuffer.length);
             this._bufferState.savedInitSegments = [];
             
             for (let i = 0; i < packetsToSave; i++) {
                 // Create a new copy of each packet
-                const packetCopy = new Uint8Array(this._bufferState.activeBuffer[i]);
-                this._bufferState.savedInitSegments.push(packetCopy);
+                if (i < this._bufferState.activeBuffer.length) {
+                    const packetCopy = new Uint8Array(this._bufferState.activeBuffer[i]);
+                    this._bufferState.savedInitSegments.push(packetCopy);
+                }
             }
             
-            Log.v(this.TAG, `Saved ${packetsToSave} packets from first stream for future initialization`);
+            Log.v(this.TAG, `Saved ${this._bufferState.savedInitSegments.length} packets from first stream for future initialization`);
         }
         
         // Activate the dual buffer mode
@@ -1098,7 +1261,9 @@ _dispatchKeyframeAwareChunk() {
         this._keyframePositions = this._bufferState.pendingKeyframePositions;
         
         // Clear the PTS handler flag immediately
-        this._ptsHandler._newStreamStarted = false;
+        if (this._ptsHandler) {
+            this._ptsHandler._newStreamStarted = false;
+        }
         
         Log.v(this.TAG, `Switched to pending buffer for stream #${this._bufferState.streamCounter}. Will drain active buffer first.`);
         
@@ -1108,7 +1273,7 @@ _dispatchKeyframeAwareChunk() {
     // SPECIAL HANDLING FOR DRAIN MODE
     if (this._bufferState.drainActive) {
         // Check if active buffer is empty or near-empty (less than 50 packets)
-        if (this._bufferState.activeBuffer.length <= 50) {
+        if (!this._bufferState.activeBuffer || this._bufferState.activeBuffer.length <= 50) {
             // Almost drained, prepare to switch to the pending buffer
             
             // 1. If we have saved init segments, queue them up to be sent first
@@ -1150,8 +1315,11 @@ _dispatchKeyframeAwareChunk() {
             Log.v(this.TAG, `Stream #${this._bufferState.streamCounter}: Active buffer drained, switching to new stream data`);
             
             // Make the pending buffer the new active buffer
+            if (!this._bufferState.pendingBuffer) {
+                this._bufferState.pendingBuffer = [];
+            }
             this._bufferState.activeBuffer = this._bufferState.pendingBuffer;
-            this._bufferState.activeKeyframePositions = this._bufferState.pendingKeyframePositions;
+            this._bufferState.activeKeyframePositions = this._bufferState.pendingKeyframePositions || [];
             
             // Create new empty pending buffer for future transitions
             this._bufferState.pendingBuffer = [];
@@ -1179,7 +1347,7 @@ _dispatchKeyframeAwareChunk() {
         
         // If we're still draining, focus on emptying the active buffer
         // Dispatch larger chunks to empty it faster
-        const drainChunkSize = Math.min(250, this._bufferState.activeBuffer.length);
+        const drainChunkSize = Math.min(250, this._bufferState.activeBuffer ? this._bufferState.activeBuffer.length : 0);
         
         if (drainChunkSize > 0) {
             Log.v(this.TAG, `Draining active buffer: ${drainChunkSize} packets, ${this._bufferState.activeBuffer.length - drainChunkSize} remaining`);
@@ -1190,7 +1358,7 @@ _dispatchKeyframeAwareChunk() {
             
             // Temporarily switch to the active buffer for dispatching
             this._packetBuffer = this._bufferState.activeBuffer;
-            this._keyframePositions = this._bufferState.activeKeyframePositions;
+            this._keyframePositions = this._bufferState.activeKeyframePositions || [];
             
             // Dispatch from the active buffer
             this._dispatchPacketChunk(drainChunkSize);
@@ -1198,7 +1366,7 @@ _dispatchKeyframeAwareChunk() {
             // Update the active keyframe positions after dispatch
             this._bufferState.activeKeyframePositions = this._keyframePositions
                 .map(pos => pos)
-                .filter(pos => pos >= 0 && pos < this._bufferState.activeBuffer.length);
+                .filter(pos => pos >= 0 && pos < (this._bufferState.activeBuffer ? this._bufferState.activeBuffer.length : 0));
             
             // Switch back to the buffer we were working with
             this._packetBuffer = currentPacketBuffer;
@@ -1215,7 +1383,8 @@ _dispatchKeyframeAwareChunk() {
     
     // DISPATCH THROTTLING - Avoid too frequent dispatches during high load periods
     const now = Date.now();
-    if ((now - this._bufferState.lastDispatchTime) < this._bufferState.minDispatchInterval) {
+    if (this._bufferState.lastDispatchTime && 
+        (now - this._bufferState.lastDispatchTime) < this._bufferState.minDispatchInterval) {
         // Skip this dispatch cycle to prevent overwhelming MSE
         return;
     }
@@ -1224,15 +1393,15 @@ _dispatchKeyframeAwareChunk() {
     this._bufferState.minDispatchInterval = 0;
     
     // STANDARD KEYFRAME-BASED DISPATCH (Normal operation mode)
-    const numKeyframes = this._keyframePositions.length;
+    const numKeyframes = this._keyframePositions ? this._keyframePositions.length : 0;
     
     // If no keyframes but buffer getting large, force a rescan
-    if (numKeyframes === 0 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
+    if (numKeyframes === 0 && this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets) {
         Log.v(this.TAG, `No keyframes in buffer of ${this._packetBuffer.length} packets. Forcing keyframe scan.`);
         this._rescanBufferForKeyframes();
         
         // If still no keyframes, dispatch a reasonable amount
-        if (this._keyframePositions.length === 0 && 
+        if ((!this._keyframePositions || this._keyframePositions.length === 0) && 
             this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
             const packetsToDispatch = Math.min(
                 Math.floor(this._packetBuffer.length / 3),
@@ -1268,7 +1437,7 @@ _dispatchKeyframeAwareChunk() {
         this._keyframePositions = this._keyframePositions
             .slice(endKeyframeIndex)
             .map(pos => pos - endPos)
-            .filter(pos => pos >= 0 && pos < this._packetBuffer.length);
+            .filter(pos => pos >= 0 && pos < (this._packetBuffer ? this._packetBuffer.length : 0));
             
         return;
     }
@@ -1289,7 +1458,7 @@ _dispatchKeyframeAwareChunk() {
         }
         
         // If buffer is getting too large with just one keyframe, dispatch some data
-        if (this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
+        if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets * 1.2) {
             const packetsToDispatch = Math.min(
                 Math.floor(this._packetBuffer.length / 3),
                 250
@@ -1306,7 +1475,7 @@ _dispatchKeyframeAwareChunk() {
     }
     
     // Force dispatch if buffer exceeds threshold
-    if (this._packetBuffer.length > this.config.forceDispatchThreshold) {
+    if (this._packetBuffer && this._packetBuffer.length > this.config.forceDispatchThreshold) {
         const excessPackets = Math.min(
             this._packetBuffer.length - this.config.bufferSizeInPackets,
             300
@@ -1323,7 +1492,7 @@ _dispatchKeyframeAwareChunk() {
     }
     
     // If we reach here with no keyframes and buffer is not too full, wait for more data
-    if (numKeyframes === 0 && this._packetBuffer.length < this.config.bufferSizeInPackets * 1.5) {
+    if (numKeyframes === 0 && this._packetBuffer && this._packetBuffer.length < this.config.bufferSizeInPackets * 1.5) {
         if (this.config.enableDetailedLogging) {
             Log.v(this.TAG, `No keyframes detected yet, waiting (buffer: ${this._packetBuffer.length} packets)`);
         }
@@ -1332,12 +1501,32 @@ _dispatchKeyframeAwareChunk() {
 
 /**
  * Process a chunk of MPEG-TS data and manage buffer
- * Modified to handle dual buffer system
+ * Modified to handle dual buffer system with enhanced error checking
  * 
  * @param {Uint8Array} chunk The chunk of MPEG-TS data to process
  */
 _processChunk(chunk) {
     if (!chunk || chunk.length === 0) return;
+    
+    // Ensure _bufferState exists - initialize if needed
+    if (!this._bufferState) {
+        this._bufferState = {
+            activeBuffer: this._packetBuffer || [],
+            pendingBuffer: [],
+            activeKeyframePositions: this._keyframePositions || [],
+            pendingKeyframePositions: [],
+            streamCounter: 1,
+            transitionPending: false,
+            drainActive: false,
+            savedInitSegments: null,
+            lastDispatchTime: 0,
+            minDispatchInterval: 0
+        };
+        
+        // Point the main buffer references to the active buffer
+        this._packetBuffer = this._bufferState.activeBuffer;
+        this._keyframePositions = this._bufferState.activeKeyframePositions;
+    }
 
     // Extract and validate TS packets
     for (let i = 0; i < chunk.length; i += this.PACKET_SIZE) {
@@ -1350,8 +1539,20 @@ _processChunk(chunk) {
                 let targetBuffer = this._packetBuffer; // Points to current active or pending buffer
                 let targetKeyframePositions = this._keyframePositions;
                 
+                if (!targetBuffer) {
+                    // If somehow buffer is undefined, recreate it
+                    targetBuffer = [];
+                    this._packetBuffer = targetBuffer;
+                }
+                
+                if (!targetKeyframePositions) {
+                    // If somehow keyframe positions is undefined, recreate it
+                    targetKeyframePositions = [];
+                    this._keyframePositions = targetKeyframePositions;
+                }
+                
                 // Process PTS information and detect keyframes
-                if (this.config.enablePTSContinuity) {
+                if (this.config.enablePTSContinuity && this._ptsHandler) {
                     // Pass current buffer position for keyframe tracking
                     const isKeyframe = this._processPTSInPacket(packet, targetBuffer.length);
                     
@@ -1370,62 +1571,260 @@ _processChunk(chunk) {
                 if (currentBufferSize >= this.config.maxBufferSize) {
                     Log.w(this.TAG, `Target buffer reached maximum size (${currentBufferSize} packets), forcing dispatch`);
                     
-                    // Force dispatch only if we're working with the active buffer and not in transition
-                    if (!this._bufferState.transitionPending || targetBuffer === this._bufferState.activeBuffer) {
-                        // During drain mode, use the drain logic
-                        if (this._bufferState.drainActive) {
-                            // Immediate call to dispatch logic
-                            this._dispatchKeyframeAwareChunk();
+                    try {
+                        // Safe check for buffer state and transitions
+                        if (this._bufferState) {
+                            const isInTransition = this._bufferState.transitionPending || false;
+                            const isActiveBuffer = (targetBuffer === this._bufferState.activeBuffer);
+                            const isDraining = this._bufferState.drainActive || false;
+                            
+                            // Force dispatch only if we're working with the active buffer and not in transition
+                            // or if we're in drain mode
+                            if ((!isInTransition || isActiveBuffer) && !isDraining) {
+                                // Normal dispatch for active buffer when not in transition
+                                const packetsToDispatch = Math.min(300, currentBufferSize - this.config.bufferSizeInPackets);
+                                Log.v(this.TAG, `Large buffer (${currentBufferSize} packets). Dispatching ${packetsToDispatch} packets.`);
+                                this._dispatchPacketChunk(packetsToDispatch);
+                            } else if (isDraining) {
+                                // During drain mode, use the drain logic
+                                this._dispatchKeyframeAwareChunk();
+                            } else {
+                                // If we're in transition and the pending buffer is getting too full, 
+                                // just log it - we'll handle it when we switch buffers
+                                Log.v(this.TAG, `Pending buffer growing large (${currentBufferSize} packets) during transition.`);
+                            }
                         } else {
-                            // Normal dispatch for active buffer when not in transition
-                            // We can't dispatch from pending buffer yet
+                            // Fallback if buffer state is missing
                             const packetsToDispatch = Math.min(300, currentBufferSize - this.config.bufferSizeInPackets);
-                            Log.v(this.TAG, `Large buffer (${currentBufferSize} packets). Dispatching ${packetsToDispatch} packets.`);
+                            Log.v(this.TAG, `Buffer state missing. Dispatching ${packetsToDispatch} packets from buffer.`);
                             this._dispatchPacketChunk(packetsToDispatch);
                         }
-                    } else {
-                        // If we're in transition and the pending buffer is getting too full, 
-                        // just log it - we'll handle it when we switch buffers
-                        Log.v(this.TAG, `Pending buffer growing large (${currentBufferSize} packets) during transition.`);
+                    } catch (e) {
+                        // Error recovery - if dispatch fails, log and continue
+                        Log.e(this.TAG, `Error during forced dispatch: ${e.message}. Continuing...`);
+                        // Reset state to avoid getting stuck in error state
+                        if (this._bufferState) {
+                            this._bufferState.transitionPending = false;
+                            this._bufferState.drainActive = false;
+                        }
                     }
                 }
             }
         }
     }
 
-    // Update buffer fullness stats based on which buffer is currently in use
-    const currentBufferSize = this._packetBuffer.length;
-    this.stats.bufferFullness = currentBufferSize / this.config.bufferSizeInPackets;
+    // Update buffer fullness stats
+    if (this._packetBuffer) {
+        const currentBufferSize = this._packetBuffer.length;
+        this.stats.bufferFullness = currentBufferSize / this.config.bufferSizeInPackets;
+    } else {
+        this.stats.bufferFullness = 0;
+    }
 
     // Check if initial buffering is complete
     if (!this._initialBufferingComplete) {
         // Only start playback when buffer is filled to the specified threshold
         // AND we have at least one keyframe in the buffer
-        if (this.stats.bufferFullness >= this.config.initialBufferingThreshold &&
-            (!this.config.keyframeAwareChunking || this._keyframePositions.length > 0)) {
-
+        const hasKeyframes = this._keyframePositions && this._keyframePositions.length > 0;
+        const hasEnoughBuffer = this.stats.bufferFullness >= this.config.initialBufferingThreshold;
+        
+        if (hasEnoughBuffer && (!this.config.keyframeAwareChunking || hasKeyframes)) {
             this._initialBufferingComplete = true;
             this._status = LoaderStatus.kComplete;
-            Log.v(this.TAG, `Initial buffering complete: ${Math.round(this.stats.bufferFullness * 100)}% full with ${this._keyframePositions.length} keyframes`);
+            Log.v(this.TAG, `Initial buffering complete: ${Math.round(this.stats.bufferFullness * 100)}% full with ${hasKeyframes ? this._keyframePositions.length : 0} keyframes`);
         } else {
             // Still in initial buffering phase
             return; // Don't dispatch packets yet
         }
     }
 
-    // Regular dispatch processing follows the usual rules except in transition mode
-    // In transition mode, _dispatchKeyframeAwareChunk() manages everything
+    // If keyframe detection is enabled but we don't have any keyframes yet,
+    // perform a scan when buffer reaches a certain size
+    if (this.config.keyframeAwareChunking && 
+        (!this._keyframePositions || this._keyframePositions.length === 0) && 
+        this._packetBuffer && this._packetBuffer.length > 100) {
+        this._rescanBufferForKeyframes();
+    }
+
+    try {
+        // Ensure _bufferState exists before continuing
+        if (!this._bufferState) {
+            return;
+        }
+        
+        // Enhanced dispatch logic with forced dispatch for overly full buffers
+        if (this._packetBuffer && this._packetBuffer.length > this.config.forceDispatchThreshold) {
+            // Buffer is extremely full, force dispatch
+            Log.w(this.TAG, `Buffer exceeding force threshold (${this._packetBuffer.length}/${this.config.forceDispatchThreshold}), forcing dispatch`);
+
+            if (this.config.keyframeAwareChunking && this._keyframePositions && this._keyframePositions.length > 1) {
+                this._dispatchKeyframeAwareChunk();
+            } else {
+                // Fallback to regular dispatch
+                const packetsToDispatch = this._packetBuffer.length - this.config.bufferSizeInPackets;
+                this._dispatchPacketChunk(Math.max(packetsToDispatch, 50)); // At least 50 packets
+            }
+        }
+        // Normal dispatch logic - only if buffer exceeds target size
+        else if (this._packetBuffer && this._packetBuffer.length > this.config.bufferSizeInPackets) {
+            // Only dispatch if we're not in a transition
+            const isInTransition = this._bufferState.transitionPending || false;
+            const isDraining = this._bufferState.drainActive || false;
+            
+            if (!isInTransition || !isDraining) {
+                if (this.config.keyframeAwareChunking) {
+                    this._dispatchKeyframeAwareChunk();
+                } else {
+                    // Original excess-based dispatch
+                    const excessPackets = this._packetBuffer.length - this.config.bufferSizeInPackets;
+                    const packetsToDispatch = Math.min(excessPackets, this.config.dispatchChunkSize);
+
+                    if (this.config.enableDetailedLogging) {
+                        Log.v(this.TAG, `Buffer exceeds target (${this._packetBuffer.length}/${this.config.bufferSizeInPackets}), dispatching ${packetsToDispatch} packets`);
+                    }
+
+                    this._dispatchPacketChunk(packetsToDispatch);
+                }
+            }
+        }
+    } catch (e) {
+        // Error recovery for dispatch logic
+        Log.e(this.TAG, `Error in dispatch logic: ${e.message}. Continuing...`);
+        // Try to recover by resetting transition states
+        if (this._bufferState) {
+            this._bufferState.transitionPending = false;
+            this._bufferState.drainActive = false;
+        }
+    }
 }
 
 /**
  * Update internal references to point to the active buffer
- * This is a helper function to ensure all operations use the correct buffer
+ * Enhanced with initialization and error checking
  */
 _useActiveBuffer() {
-    if (this._bufferState) {
-        this._packetBuffer = this._bufferState.activeBuffer;
-        this._keyframePositions = this._bufferState.activeKeyframePositions;
+    // Check if buffer state exists, if not initialize it
+    if (!this._bufferState) {
+        Log.v(this.TAG, `Initializing missing buffer state in _useActiveBuffer`);
+        this._bufferState = {
+            activeBuffer: this._packetBuffer || [],
+            pendingBuffer: [],
+            activeKeyframePositions: this._keyframePositions || [],
+            pendingKeyframePositions: [],
+            streamCounter: 1,
+            transitionPending: false,
+            drainActive: false,
+            savedInitSegments: null,
+            lastDispatchTime: 0,
+            minDispatchInterval: 0
+        };
     }
+    
+    // If active buffer is missing, recreate it
+    if (!this._bufferState.activeBuffer) {
+        this._bufferState.activeBuffer = [];
+        Log.w(this.TAG, `Active buffer was undefined, recreated empty buffer`);
+    }
+    
+    // If active keyframe positions is missing, recreate it
+    if (!this._bufferState.activeKeyframePositions) {
+        this._bufferState.activeKeyframePositions = [];
+        Log.w(this.TAG, `Active keyframe positions was undefined, recreated empty array`);
+    }
+    
+    // Update the reference to point to the active buffer
+    this._packetBuffer = this._bufferState.activeBuffer;
+    this._keyframePositions = this._bufferState.activeKeyframePositions;
+    
+    if (this.config && this.config.enableDetailedLogging) {
+        Log.v(this.TAG, `Switched to active buffer: ${this._packetBuffer.length} packets with ${this._keyframePositions.length} keyframes`);
+    }
+}
+
+/**
+ * Update internal references to point to the pending buffer
+ * Enhanced with initialization and error checking
+ */
+_usePendingBuffer() {
+    // Check if buffer state exists, if not initialize it
+    if (!this._bufferState) {
+        Log.v(this.TAG, `Initializing missing buffer state in _usePendingBuffer`);
+        this._bufferState = {
+            activeBuffer: this._packetBuffer || [],
+            pendingBuffer: [],
+            activeKeyframePositions: this._keyframePositions || [],
+            pendingKeyframePositions: [],
+            streamCounter: 1,
+            transitionPending: false,
+            drainActive: false,
+            savedInitSegments: null,
+            lastDispatchTime: 0,
+            minDispatchInterval: 0
+        };
+    }
+    
+    // If pending buffer is missing, recreate it
+    if (!this._bufferState.pendingBuffer) {
+        this._bufferState.pendingBuffer = [];
+        Log.w(this.TAG, `Pending buffer was undefined, recreated empty buffer`);
+    }
+    
+    // If pending keyframe positions is missing, recreate it
+    if (!this._bufferState.pendingKeyframePositions) {
+        this._bufferState.pendingKeyframePositions = [];
+        Log.w(this.TAG, `Pending keyframe positions was undefined, recreated empty array`);
+    }
+    
+    // Update the reference to point to the pending buffer
+    this._packetBuffer = this._bufferState.pendingBuffer;
+    this._keyframePositions = this._bufferState.pendingKeyframePositions;
+    
+    if (this.config && this.config.enableDetailedLogging) {
+        Log.v(this.TAG, `Switched to pending buffer: ${this._packetBuffer.length} packets with ${this._keyframePositions.length} keyframes`);
+    }
+}
+
+/**
+ * Reset buffer state and create fresh buffer objects
+ * This should be called during major state changes like seeks or errors
+ */
+_resetBufferState() {
+    Log.v(this.TAG, `Resetting buffer state`);
+    
+    // Create fresh arrays
+    const newActiveBuffer = [];
+    const newKeyframePositions = [];
+    
+    // Initialize buffer state with fresh objects
+    this._bufferState = {
+        activeBuffer: newActiveBuffer,
+        pendingBuffer: [],
+        activeKeyframePositions: newKeyframePositions,
+        pendingKeyframePositions: [],
+        streamCounter: 1,
+        transitionPending: false,
+        drainActive: false,
+        savedInitSegments: null,
+        lastDispatchTime: 0,
+        minDispatchInterval: 0
+    };
+    
+    // Point main references to the fresh objects
+    this._packetBuffer = newActiveBuffer;
+    this._keyframePositions = newKeyframePositions;
+    
+    // Reset other related flags
+    this._initialBufferingComplete = false;
+    
+    // Update stats
+    this.stats.bufferFullness = 0;
+    this.stats.keyframesDetected = 0;
+    
+    if (this._ptsHandler) {
+        this._ptsHandler.reset();
+    }
+    
+    Log.v(this.TAG, `Buffer state has been reset to empty`);
 }
 
 /**
@@ -2023,50 +2422,156 @@ _logDiagnostics() {
         }
     }
 
-    async abort() {
-        this._requestAbort = true;
+/**
+ * Aborts the current loading process, closes connections and releases resources
+ * Enhanced with proper cleanup and error handling for dual buffer system
+ *
+ * @returns {Promise} Resolves when abort is complete
+ */
+async abort() {
+    // Set abort flag first to prevent further processing
+    this._requestAbort = true;
+    Log.v(this.TAG, "Aborting WebTransport loader");
 
-        // Clear diagnostic timer
-        if (this.diagnosticTimer) {
-            clearInterval(this.diagnosticTimer);
-            this.diagnosticTimer = null;
-        }
+    // Create a list to track cleanup operations
+    const cleanupTasks = [];
 
-        try {
-            // Cancel current stream reader if active
-            if (this._currentStreamReader) {
-                await this._currentStreamReader.cancel("Loader aborted").catch(() => {});
-                this._currentStreamReader = null;
-            }
-
-            // Cancel stream reader
-            if (this._streamReader) {
-                await this._streamReader.cancel("Loader aborted").catch(() => {});
-                this._streamReader = null;
-            }
-
-            // Dispatch any remaining packets
-            if (this._packetBuffer.length > 0) {
-                this._dispatchPacketChunk(this._packetBuffer.length);
-            }
-
-            // Close transport
-            if (this._transport && !this._transport.closed) {
-                await this._transport.close().catch(() => {});
-            }
-
-        } catch (e) {
-            Log.e(this.TAG, `Error during abort: ${e.message}`);
-        } finally {
-            this._transport = null;
-            this._packetBuffer = [];
-            this._status = LoaderStatus.kComplete;
-        }
+    // Clear diagnostic timer
+    if (this.diagnosticTimer) {
+        clearInterval(this.diagnosticTimer);
+        this.diagnosticTimer = null;
+        Log.v(this.TAG, "Diagnostics timer cleared");
     }
 
-    /**
-     * Log diagnostics information about the stream, buffer and PTS continuity
-     */
+    // Clear performance monitoring timer if present
+    if (this._performanceMonitorTimer) {
+        clearInterval(this._performanceMonitorTimer);
+        this._performanceMonitorTimer = null;
+        Log.v(this.TAG, "Performance monitor timer cleared");
+    }
+
+    try {
+        // Cancel current stream reader if active
+        if (this._currentStreamReader) {
+            cleanupTasks.push(
+                this._currentStreamReader.cancel("Loader aborted")
+                    .catch(e => Log.w(this.TAG, `Error canceling current stream reader: ${e.message}`))
+            );
+            this._currentStreamReader = null;
+            Log.v(this.TAG, "Current stream reader canceled");
+        }
+
+        // Cancel stream reader
+        if (this._streamReader) {
+            cleanupTasks.push(
+                this._streamReader.cancel("Loader aborted")
+                    .catch(e => Log.w(this.TAG, `Error canceling stream reader: ${e.message}`))
+            );
+            this._streamReader = null;
+            Log.v(this.TAG, "Stream reader canceled");
+        }
+
+        // Handle both buffers if using dual buffer system
+        try {
+            if (this._bufferState) {
+                // Try to dispatch remaining packets from active buffer first
+                if (this._bufferState.activeBuffer && this._bufferState.activeBuffer.length > 0) {
+                    // Keep a reference to active buffer state
+                    const savedPacketBuffer = this._packetBuffer;
+                    const savedKeyframePositions = this._keyframePositions;
+
+                    // Point to active buffer
+                    this._packetBuffer = this._bufferState.activeBuffer;
+                    try {
+                        Log.v(this.TAG, `Dispatching ${this._packetBuffer.length} remaining packets from active buffer`);
+                        await this._dispatchPacketChunk(this._packetBuffer.length);
+                    } catch (e) {
+                        Log.w(this.TAG, `Error dispatching active buffer during abort: ${e.message}`);
+                    }
+
+                    // Restore original references
+                    this._packetBuffer = savedPacketBuffer;
+                    this._keyframePositions = savedKeyframePositions;
+                }
+
+                // Clear buffer references to release memory
+                this._bufferState.activeBuffer = [];
+                this._bufferState.pendingBuffer = [];
+                this._bufferState.activeKeyframePositions = [];
+                this._bufferState.pendingKeyframePositions = [];
+                this._bufferState.savedInitSegments = null;
+
+                Log.v(this.TAG, "Dual buffer system cleared");
+            } else if (this._packetBuffer && this._packetBuffer.length > 0) {
+                // Fallback if _bufferState doesn't exist but we have packets to dispatch
+                try {
+                    Log.v(this.TAG, `Dispatching ${this._packetBuffer.length} remaining packets from buffer`);
+                    await this._dispatchPacketChunk(this._packetBuffer.length);
+                } catch (e) {
+                    Log.w(this.TAG, `Error dispatching packet buffer during abort: ${e.message}`);
+                }
+            }
+        } catch (bufferError) {
+            // Don't let buffer errors stop the abort process
+            Log.e(this.TAG, `Error handling buffers during abort: ${bufferError.message}`);
+        }
+
+        // Close transport
+        if (this._transport && !this._transport.closed) {
+            cleanupTasks.push(
+                this._transport.close()
+                    .catch(e => Log.w(this.TAG, `Error closing transport: ${e.message}`))
+            );
+            Log.v(this.TAG, "Transport close requested");
+        }
+
+        // Wait for all cleanup tasks to complete
+        if (cleanupTasks.length > 0) {
+            await Promise.all(cleanupTasks).catch(e => {
+                Log.w(this.TAG, `Some cleanup tasks failed: ${e.message}`);
+            });
+        }
+
+    } catch (e) {
+        // Log the error but continue with cleanup
+        Log.e(this.TAG, `Error during abort: ${e.message}`);
+    } finally {
+        // Final cleanup regardless of errors
+        this._transport = null;
+        this._currentStreamReader = null;
+        this._streamReader = null;
+
+        // Clear buffer references
+        this._packetBuffer = [];
+        this._keyframePositions = [];
+
+        // Reset buffer state
+        if (this._bufferState) {
+            this._bufferState = {
+                activeBuffer: [],
+                pendingBuffer: [],
+                activeKeyframePositions: [],
+                pendingKeyframePositions: [],
+                streamCounter: 1,
+                transitionPending: false,
+                drainActive: false,
+                savedInitSegments: null,
+                lastDispatchTime: 0,
+                minDispatchInterval: 0
+            };
+        }
+
+        // Reset other state variables
+        this._dispatchErrorCount = 0;
+        this._dispatchErrorBackoffTime = 0;
+
+        // Set final status
+        this._status = LoaderStatus.kComplete;
+
+        Log.v(this.TAG, "Abort completed, resources released");
+    }
+}
+
     _logDiagnostics() {
         if (this._requestAbort) return;
 
