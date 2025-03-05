@@ -318,6 +318,9 @@ class WebTransportLoader extends BaseLoader {
 	this._maxConsecutiveErrors = 5;
 	this._dispatchErrorBackoffTime = 0;
 
+	this._savedInitSegments = { video: null, audio: null };
+	this._hasReceivedInitSegments = false;
+
         // Configure settings with option overrides
         this.config = {
             // Logging
@@ -1037,8 +1040,92 @@ async _readStreamData(reader) {
         return isKeyframe;
     }
     
+
 	_dispatchKeyframeAwareChunk() {
-	    // SAFETY CHECK - If buffer is extremely large, force non-keyframe dispatch
+	    // Initialize state variables if they don't exist yet
+	    if (this._savedInitData === undefined) {
+		this._savedInitData = null;
+		this._firstStreamSeen = false;
+		this._pendingStreamReset = false;
+		this._inStreamTransition = false;
+	    }
+	    
+	    // STREAM TRANSITION HANDLING
+	    if (this._ptsHandler._newStreamStarted || this._pendingStreamReset) {
+		// If this is our first stream and we haven't saved init data yet
+		if (!this._firstStreamSeen && this._packetBuffer.length > 400) {
+		    // Save a substantial chunk of the first stream for future initialization
+		    const saveSize = Math.min(800, this._packetBuffer.length);
+		    this._savedInitData = this._packetBuffer.slice(0, saveSize).map(p => new Uint8Array(p));
+		    Log.v(this.TAG, `Saved ${saveSize} packets from first stream for future initialization`);
+		    this._firstStreamSeen = true;
+		}
+		
+		// Clear the buffer and state
+		this._packetBuffer = [];
+		this._keyframePositions = [];
+		this._inStreamTransition = true;
+		this._pendingStreamReset = false;
+		
+		// Clear the PTS handler flag immediately
+		this._ptsHandler._newStreamStarted = false;
+		
+		Log.v(this.TAG, "Stream transition: Buffer reset complete");
+		
+		// Return immediately to wait for more data
+		return;
+	    }
+	    
+	    // HANDLE POST-STREAM TRANSITION
+	    if (this._inStreamTransition) {
+		// Wait for enough data to accumulate
+		if (this._packetBuffer.length < 300) {
+		    if (this._packetBuffer.length % 50 === 0) {
+			Log.v(this.TAG, `Post-transition: Accumulating data (${this._packetBuffer.length}/300 packets)`);
+		    }
+		    return;
+		}
+		
+		// If we have saved initialization data, send it first
+		if (this._savedInitData && this._savedInitData.length > 0) {
+		    Log.v(this.TAG, `Post-transition: Sending saved init data (${this._savedInitData.length} packets)`);
+		    
+		    // Create a combined packet from the saved data
+		    const totalLength = this._savedInitData.reduce((sum, packet) => sum + packet.length, 0);
+		    const initChunk = new Uint8Array(totalLength);
+		    
+		    let offset = 0;
+		    for (const packet of this._savedInitData) {
+			initChunk.set(packet, offset);
+			offset += packet.length;
+		    }
+		    
+		    // Send the init data
+		    if (this._onDataArrival) {
+			try {
+			    this._onDataArrival(initChunk.buffer, 0, initChunk.byteLength);
+			    Log.v(this.TAG, `Sent ${initChunk.byteLength} bytes of saved initialization data`);
+			} catch (e) {
+			    Log.e(this.TAG, `Error sending init data: ${e.message}`);
+			}
+		    }
+		} else {
+		    Log.w(this.TAG, "No saved initialization data available");
+		}
+		
+		// Reset the transition flag
+		this._inStreamTransition = false;
+		
+		// Continue with normal processing
+		this._rescanBufferForKeyframes();
+		
+		Log.v(this.TAG, "Post-transition initialization complete, resuming normal operation");
+		
+		// Don't dispatch packets this cycle to avoid overwhelming the pipeline
+		return;
+	    }
+	    
+	    // STANDARD OPERATION - SAFETY CHECK
 	    if (this._packetBuffer.length > 1500) {
 		// Critical situation - force dispatch regardless of keyframes
 		const packetsToDispatch = Math.min(this._packetBuffer.length - 400, 1000);
@@ -1055,57 +1142,6 @@ async _readStreamData(reader) {
 	    
 	    // Get the current number of keyframes detected
 	    const numKeyframes = this._keyframePositions.length;
-	    
-	    // Stream transition handling
-	    if (this._ptsHandler._newStreamStarted) {
-		Log.v(this.TAG, `Stream transition detected with ${numKeyframes} keyframes in buffer`);
-		
-		// Add a forced rescan in case keyframes weren't detected yet
-		if (numKeyframes < 2) {
-		    this._rescanBufferForKeyframes();
-		}
-		
-		// Ensure we have at least one keyframe
-		if (this._keyframePositions.length === 0) {
-		    Log.w(this.TAG, `No keyframes found after stream transition. Marking first packet as keyframe.`);
-		    this._keyframePositions.push(0); // Force first packet to be considered a keyframe
-		}
-		
-		// CRITICAL FIX: Calculate a substantial chunk size for the first dispatch after stream transition
-		// Ensure we never send just a single packet
-		const minStreamInitPackets = 50; // Minimum amount to include full codec data
-		
-		let packetsToDispatch = minStreamInitPackets;
-		
-		if (this._keyframePositions.length > 1) {
-		    // If we have multiple keyframes, dispatch BOTH the first and second keyframe together
-		    // This is crucial - the codec info is often spread across multiple keyframes
-		    const secondKeyframePos = this._keyframePositions[1];
-		    // Add extra packets after the second keyframe
-		    packetsToDispatch = Math.max(minStreamInitPackets, secondKeyframePos + 30);
-		} else {
-		    // Only have one keyframe, take a large chunk
-		    packetsToDispatch = Math.max(minStreamInitPackets, Math.floor(this._packetBuffer.length / 3));
-		}
-		
-		// Limit to available packets
-		packetsToDispatch = Math.min(packetsToDispatch, this._packetBuffer.length);
-		
-		Log.v(this.TAG, `Stream transition: Dispatching ${packetsToDispatch} packets to ensure complete codec initialization`);
-		
-		// Dispatch the packets
-		this._dispatchPacketChunk(packetsToDispatch);
-		
-		// Clear the new stream flag after dispatch
-		this._ptsHandler._newStreamStarted = false;
-		
-		// Update keyframe positions
-		this._keyframePositions = this._keyframePositions
-		    .map(pos => pos - packetsToDispatch)
-		    .filter(pos => pos >= 0);
-		    
-		return;
-	    }
 	    
 	    // If no keyframes but buffer getting large, force a rescan
 	    if (numKeyframes === 0 && this._packetBuffer.length > this.config.bufferSizeInPackets) {
@@ -1201,6 +1237,74 @@ async _readStreamData(reader) {
 		    Log.v(this.TAG, `No keyframes detected yet, waiting (buffer: ${this._packetBuffer.length} packets)`);
 		}
 	    }
+	}
+
+	_dispatchPacketChunkAndSaveInit(packetCount) {
+	    if (this._packetBuffer.length === 0 || packetCount <= 0) return;
+
+	    // Limit to available packets
+	    const actualPacketsToDispatch = Math.min(packetCount, this._packetBuffer.length);
+
+	    // Get packets to dispatch
+	    const packetsToDispatch = this._packetBuffer.slice(0, actualPacketsToDispatch);
+
+	    // Remove those packets from the buffer
+	    this._packetBuffer = this._packetBuffer.slice(actualPacketsToDispatch);
+
+	    // Combine packets into a single chunk
+	    const totalLength = packetsToDispatch.reduce((sum, packet) => sum + packet.length, 0);
+	    const chunk = new Uint8Array(totalLength);
+
+	    let offset = 0;
+	    packetsToDispatch.forEach(packet => {
+		chunk.set(packet, offset);
+		offset += packet.length;
+	    });
+
+	    Log.v(this.TAG, `INITIALIZATION SEGMENT: Dispatching ${actualPacketsToDispatch} packets (${(totalLength / 1024).toFixed(1)} KB)`);
+
+	    // Flag that we should listen for and save initialization segments if we haven't already
+	    const shouldSaveInitSegments = !this._hasReceivedInitSegments;
+
+	    // Send to demuxer
+	    if (this._onDataArrival) {
+		try {
+		    // Here, we need to update our demuxer to notify us when init segments are parsed
+		    // For the purpose of this example, let's assume we add a callback parameter
+		    const result = this._onDataArrival(chunk.buffer, 0, totalLength, {
+			shouldSaveInitSegments: shouldSaveInitSegments,
+			onInitSegment: (type, data) => {
+			    // Save initialization segments when they're generated
+			    if (type === 'video' && !this._savedInitSegments.video) {
+				this._savedInitSegments.video = new Uint8Array(data);
+				Log.v(this.TAG, "Saved video initialization segment");
+			    } else if (type === 'audio' && !this._savedInitSegments.audio) {
+				this._savedInitSegments.audio = new Uint8Array(data);
+				Log.v(this.TAG, "Saved audio initialization segment");
+			    }
+
+			    // Mark that we've received init segments
+			    if (this._savedInitSegments.video && this._savedInitSegments.audio) {
+				this._hasReceivedInitSegments = true;
+				Log.v(this.TAG, "Successfully saved both video and audio initialization segments");
+			    }
+			}
+		    });
+
+		    // Standard error reset logic
+		    if (this._dispatchErrorCount > 0) {
+			Log.v(this.TAG, `Dispatch succeeded after ${this._dispatchErrorCount} errors`);
+			this._dispatchErrorCount = 0;
+			this._dispatchErrorBackoffTime = 0;
+		    }
+		} catch (e) {
+		    // Standard error handling logic...
+		}
+	    }
+
+	    // Update stats after dispatch
+	    this.stats.bufferFullness = this._packetBuffer.length / this.config.bufferSizeInPackets;
+	    this._recordDispatch(actualPacketsToDispatch);
 	}
 
     /**
